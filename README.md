@@ -30,6 +30,99 @@ Documentation is available at [https://llama-cpp-python.readthedocs.io/en/latest
 
 ## Installation
 
+Requirements for Windows ROCm:
+
+  - [Python](https://www.python.org/)
+  - [Visual Studio 2022 Build Tools](https://download.visualstudio.microsoft.com/download/pr/6efb3484-905b-485c-8b5f-9d3a5f39e731/07908cd6d91e75b8ea4339d8f2cfa6e8d8bb4fd706af7b918ae391cd6fc2a066/vs_BuildTools.exe)
+  - [Clang/Clang++](https://clang.llvm.org/)
+  - [CMake](https://cmake.org/)
+  - [Ninja](https://ninja-build.org/)
+  - [Git](https://git-scm.com/)
+  - [ROCm](https://github.com/ROCm/TheRock) 
+
+## Build `llama-cpp-python` for AMD GPUs with ROCm on Windows (TheRock)
+
+### Installation Guide
+> **Note:** The following commands are intended for use in PowerShell.
+> If you are using the Windows Command Prompt (CMD), adjust the commands accordingly.
+
+### 1. Set Environment Variables
+
+Modify the paths below to match your virtual environment and ROCm directories (e.g., `_rocm_sdk_libraries_gfx120X_all`). Replace `gfx1200` with your GPU’s architecture.
+
+```powershell
+# Activate Visual Studio environment
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && set' | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }
+
+$VENV_BASE = "C:\"  # <-- CHANGE THIS TO YOUR VENV LOCATION (EXCLUDING THE `venv` FOLDER)
+
+# Set ROCm environment
+& "$VENV_BASE\venv\Scripts\Activate.ps1"
+rocm-sdk init
+
+# Use backslashes for Windows environment variables
+$ROCM_DEVEL = "$VENV_BASE\venv\Lib\site-packages\_rocm_sdk_devel"
+$ROCM_CORE  = "$VENV_BASE\venv\Lib\site-packages\_rocm_sdk_core"
+$ROCM_GFX   = "$VENV_BASE\venv\Lib\site-packages\_rocm_sdk_libraries_gfx120X_all" # <-- MATCH THIS TO YOUR INSTALLED GFX LIBRARIES PACKAGE
+
+$env:HIP_PATH = $ROCM_DEVEL
+$env:ROCM_PATH = $env:HIP_PATH
+$env:HIP_DEVICE_LIB_PATH = "$ROCM_CORE\lib\llvm\amdgcn\bitcode"
+$env:PATH = "$ROCM_DEVEL\bin;$ROCM_DEVEL\lib\llvm\bin;$ROCM_GFX\bin;$env:PATH"
+$env:CMAKE_GENERATOR = "Ninja"
+$env:HIP_PLATFORM = "amd"
+
+# Set Compiler paths (Clang)
+$env:CC = "$ROCM_DEVEL\lib\llvm\bin\clang.exe"
+$env:CXX = "$ROCM_DEVEL\lib\llvm\bin\clang++.exe"
+$env:HIP_CLANG_PATH = "$ROCM_DEVEL\lib\llvm\bin"
+
+# CMAKE_ARGS: Convert to forward slashes and add escaped quotes for space-proofing
+$ROCM_CMAKE = $ROCM_DEVEL -replace '\\', '/'
+$env:CMAKE_ARGS = "-DGGML_HIP=ON -DGGML_HIPBLAS=on -DGPU_TARGETS=gfx1200 -DCMAKE_HIP_ARCHITECTURES=gfx1200 -DCMAKE_C_COMPILER=`"$ROCM_CMAKE/lib/llvm/bin/clang.exe`" -DCMAKE_CXX_COMPILER=`"$ROCM_CMAKE/lib/llvm/bin/clang++.exe`" -DHIP_LIBRARIES=`"$ROCM_CMAKE/lib/amdhip64.lib`" -DCMAKE_PREFIX_PATH=`"$ROCM_CMAKE`""
+# REPLACE `gfx1200` ABOVE
+
+Write-Host "CMAKE_ARGS: $env:CMAKE_ARGS"
+```
+
+### 2. Build from Source and Install
+
+We use [JamePeng](https://github.com/JamePeng/llama-cpp-python)'s fork to ensure compatibility with the latest model features and optimizations:
+
+```powershell
+pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" --no-cache-dir --verbose
+```
+
+### Verification
+
+After the build and install process, run this Python one-liner to verify that the library detects your AMD GPU correctly:
+
+```powershell
+python -c "from llama_cpp import llama_cpp; print('High-level API:', llama_cpp.llama_print_system_info().decode())"
+```
+
+Expected Output:
+
+```powershell
+ggml_cuda_init: found 1 ROCm devices:
+  Device 0: AMD Radeon RX ...
+High-level API: ROCm
+```
+
+### Troubleshooting
+
+- The build process takes a couple of minutes depending on you CPU, and generates harmless warnings; it is successful if it ends with `Successfully installed llama-cpp-python-*version*`.
+- There is currently a bug that if there's a `amdhip64_7.dll` in `C:\Windows\SYSTEM32\`, then `llama-cpp-python` automatically uses that one. It should use the one installed in venv, e.g `C:\venv\Lib\site-packages\_rocm_sdk_devel\bin\amdhip64_7.dll`. In this case, there's a possibility it errors out with:
+```powershell
+ROCm error: invalid argument
+  current device: 0, in function ggml_backend_cuda_device_get_memory at C:/vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:4425
+  hipMemGetInfo(free, total)
+C:/vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:97: ROCm error
+```
+because `hipMemGetInfo` doesn't work with that `.dll` on certain systems. As a workaround, we need to force our `llama-cpp-python` launch script to use the venv `.dll` or temporarily rename the one in `System32`.
+
+## Other installation methods
+
 Requirements:
 
   - Python 3.9+

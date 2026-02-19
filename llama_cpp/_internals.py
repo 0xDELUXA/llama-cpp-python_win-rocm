@@ -714,29 +714,88 @@ def normalize_embedding(embedding):
 
 
 class LlamaTokenDataArray:
+    """
+    Performance-optimized wrapper for llama_token_data_array.
+    This class minimizes Python overhead by caching memory views and avoiding
+    redundant memory allocations during the inference loop.
+    """
     def __init__(self, *, n_vocab: int):
         self.n_vocab = n_vocab
-        self.candidates_data = np.recarray(
-            (self.n_vocab,),
+
+        # Define the structure of llama_token_data to match the C++ memory layout.
+        # id: token identifier (int32)
+        # logit: raw prediction score (float32)
+        # p: probability score (float32)
+        self.candidates_data = np.empty(
+            self.n_vocab,
             dtype=np.dtype(
-                [("id", np.intc), ("logit", np.single), ("p", np.single)], align=True
+                [("id", np.intc), ("logit", np.single), ("p", np.single)],
+                align=True
             ),
         )
+
+        # Optimization: Cache field views to bypass NumPy's expensive field lookup overhead.
+        # Using these cached views allows for direct memory access in the inference loop.
+        self._id_view = self.candidates_data["id"]
+        self._logit_view = self.candidates_data["logit"]
+        self._p_view = self.candidates_data["p"]
+
+        # Initialization: Pre-generate a standard token ID sequence (0 to n_vocab - 1).
+        # This acts as the 'golden' reference to reset the buffer after sorting operations.
+        self._default_ids = np.arange(self.n_vocab, dtype=np.intc)
+        self._id_view[:] = self._default_ids
+
+        # Construct the llama_cpp C structure.
+        # 'data' is assigned a direct pointer to the underlying NumPy memory buffer.
         self.candidates = llama_cpp.llama_token_data_array(
             data=self.candidates_data.ctypes.data_as(llama_cpp.llama_token_data_p),
             size=self.n_vocab,
             selected=-1,
             sorted=False,
         )
-        self.default_candidates_data_id = np.arange(self.n_vocab, dtype=np.intc)  # type: ignore
-        self.default_candidates_data_p = np.zeros(self.n_vocab, dtype=np.single)
 
     def copy_logits(self, logits: npt.NDArray[np.single]):
-        self.candidates_data.id[:] = self.default_candidates_data_id
-        self.candidates_data.logit[:] = logits
-        self.candidates_data.p[:] = self.default_candidates_data_p
-        self.candidates.sorted = False
+        """
+        Synchronizes the memory buffer with new logit data from the model.
+        """
+        # Step 1: Transfer new logits from the model output to our working buffer.
+        self._logit_view[:] = logits
+
+        # Step 2: Critical Reset.
+        # Samplers (like top-k or top-p) reorder elements in memory during processing.
+        # We must reset token IDs every step to ensure logical consistency for the next run.
+        self._id_view[:] = self._default_ids
+
+        # Step 3: Metadata update.
+        # Inform the llama.cpp backend that the buffer is full and currently unsorted.
         self.candidates.size = self.n_vocab
+        self.candidates.sorted = False
+        self.candidates.selected = -1
+
+    def close(self):
+        """
+        Release internal NumPy buffers and C-structure references.
+        """
+        # Main structured NumPy buffer holding token data (id, logit, prob)
+        self.candidates_data = None
+
+        # Cached NumPy field views (avoid dangling references)
+        self._id_view = None
+        self._logit_view = None
+        self._p_view = None
+
+        # Precomputed default token id array
+        self._default_ids = None
+
+        # Setting to None ensures no stale pointer references remain.
+        self.candidates = None
+
+    def __del__(self):
+        # Ensures memory cleanup in case close() was not called explicitly.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # Python wrappers over common/sampling structs
@@ -1155,7 +1214,7 @@ class LlamaSamplingContext:
         # logit bias
         if self.params.logit_bias:
             for item in self.params.logit_bias:
-                cur_p.candidates_data.logit[item.token] += item.bias
+                cur_p._logit_view[item.token] += item.bias
 
 
         # 4. grammar first
@@ -1171,7 +1230,7 @@ class LlamaSamplingContext:
             )
             # grammar-first return directly
             selected = cur_p.candidates.selected
-            return int(cur_p.candidates_data.id[selected])
+            return int(cur_p._id_view[selected])
 
 
         # 5. sampling chain
@@ -1181,7 +1240,7 @@ class LlamaSamplingContext:
         )
 
         selected = cur_p.candidates.selected
-        token = int(cur_p.candidates_data.id[selected])
+        token = int(cur_p._id_view[selected])
 
         # 6. grammar rejection sampling
         if self.grammar_sampler:
@@ -1214,21 +1273,50 @@ class LlamaSamplingContext:
             )
 
             selected = cur_p.candidates.selected
-            token = int(cur_p.candidates_data.id[selected])
+            token = int(cur_p._id_view[selected])
 
         return token
 
     def close(self):
         """
-        Clear samplers cache
+        Release all sampling-related resources and break references
+        to large buffers to allow Python GC to reclaim memory.
+
+        This method must be called when the sampling context is no longer needed,
+        especially in long-running services, to prevent memory retention.
         """
+
+        # Free grammar sampler if it was initialized.
+        # This releases underlying llama.cpp sampler memory.
         if self.grammar_sampler:
             self.grammar_sampler.close()
             self.grammar_sampler = None
 
+        # Free the sampler chain and all attached C samplers.
         if self.sampler_chain:
             self.sampler_chain.close()
             self.sampler_chain = None
+
+        # Release large token data buffer used during sampling.
+        # Important for high-vocab models to avoid memory retention.
+        if hasattr(self, "_cur_p"):
+            try:
+                self._cur_p.close()
+            except Exception:
+                pass
+            self._cur_p = None
+
+        # Clear token history deque to drop references.
+        if hasattr(self, "prev"):
+            self.prev.clear()
+            self.prev = None
+
+        # Remove NumPy view pointing to llama logits buffer.
+        self._logits_view = None
+
+        # Break references to small C structs used in grammar rejection sampling.
+        self._single_token = None
+        self._single_array = None
 
     def __del__(self):
         try:
@@ -1400,7 +1488,16 @@ class LlamaSampler:
         if not new_sampler_p:
             raise RuntimeError("llama_sampler_clone failed")
 
-        return LlamaSampler(existing_sampler_p=new_sampler_p)
+        new_sampler = LlamaSampler(existing_sampler_p=new_sampler_p)
+
+        # copy _keep_alive and custom_samplers list to new sampler
+        if self._keep_alive:
+            new_sampler._keep_alive = self._keep_alive.copy()
+
+        if self.custom_samplers:
+            new_sampler.custom_samplers = self.custom_samplers.copy()
+
+        return new_sampler
 
     def sample(self, ctx: LlamaContext, idx: int = -1) -> int:
         """

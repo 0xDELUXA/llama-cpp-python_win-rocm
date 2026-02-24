@@ -497,7 +497,8 @@ class Llama:
 
             self._stack.callback(free_lora_adapter)
 
-            if llama_cpp.llama_set_adapter_lora(
+            # Todo(JamePeng): The current LoRa loading logic is outdated and needs to be refactored.
+            if llama_cpp.llama_set_adapters_lora(
                 self._ctx.ctx, self._lora_adapter, self.lora_scale
             ):
                 raise RuntimeError(
@@ -622,6 +623,34 @@ class Llama:
                 )
 
         self._sampling_ctx: Optional[LlamaSamplingContext] = None
+
+    def close(self) -> None:
+        """Explicitly free the model from memory."""
+        if getattr(self, "_sampling_ctx", None) is not None:
+            self._sampling_ctx.close()
+            self._sampling_ctx = None
+
+        if getattr(self, "_candidates", None) is not None:
+            self._candidates.close()
+            self._candidates = None
+
+        if hasattr(self, "chat_handler") and hasattr(self.chat_handler, "close"):
+            self.chat_handler.close()
+
+        self.model_params =None
+        self.context_params = None
+        self.chat_handler = None
+        self.input_ids = None
+        self.scores = None
+        self.tokenizer_ = None
+
+        self._c_tensor_split = None
+        self._kv_overrides_array = None
+
+        self._stack.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     @property
     def ctx(self) -> llama_cpp.llama_context_p:
@@ -1045,17 +1074,31 @@ class Llama:
 
         # Check for kv cache prefix match
         if reset and self.n_tokens > 0:
-            longest_prefix = self.longest_token_prefix(self._input_ids.tolist(), tokens[:-1])
+            longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
             if longest_prefix > 0:
                 reset = False
+
+                # Physically erase trailing "ghost" tokens from the C++ KV cache
+                # to prevent attention misalignment in multi-round chats.
+                if longest_prefix < self.n_tokens:
+                    if self.verbose:
+                        print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
+                    self._ctx.memory_seq_rm(0, longest_prefix, -1)
+
+                # Adjust the tokens array and cursor to reuse the matched cache
                 tokens = tokens[longest_prefix:]
                 self.n_tokens = longest_prefix
+
                 if self.verbose:
                     print(
                         f"Llama.generate: {longest_prefix} prefix-match hit, "
                         f"remaining {len(tokens)} prompt tokens to eval",
                         file=sys.stderr,
                     )
+            else:
+                # No prefix matched. Completely clear the KV cache to prevent context poisoning.
+                self.n_tokens = 0
+                self._ctx.memory_clear(True)
 
         # Reset the model state
         if reset:
@@ -1455,10 +1498,10 @@ class Llama:
             try:
                 cache_item = self.cache[prompt_tokens]
                 cache_prefix_len = Llama.longest_token_prefix(
-                    cache_item.input_ids.tolist(), prompt_tokens
+                    cache_item.input_ids, prompt_tokens
                 )
                 eval_prefix_len = Llama.longest_token_prefix(
-                    self._input_ids.tolist(), prompt_tokens
+                    self._input_ids, prompt_tokens
                 )
                 if cache_prefix_len > eval_prefix_len:
                     self.load_state(cache_item)
@@ -2594,24 +2637,6 @@ prompt: The prompt to generate text from.
         """Return the pooling type."""
         return self._ctx.pooling_type()
 
-    def close(self) -> None:
-        """Explicitly free the model from memory."""
-        if getattr(self, "_sampling_ctx", None) is not None:
-            self._sampling_ctx.close()
-            self._sampling_ctx = None
-
-        if getattr(self, "_candidates", None) is not None:
-            self._candidates.close()
-            self._candidates = None
-
-        self.scores = None
-        self.input_ids = None
-
-        self._stack.close()
-
-    def __del__(self) -> None:
-        self.close()
-
     @staticmethod
     def logits_to_logprobs(
         logits: Union[npt.NDArray[np.single], List], axis: int = -1
@@ -2631,7 +2656,10 @@ prompt: The prompt to generate text from.
         return subtract_maxs - out
 
     @staticmethod
-    def longest_token_prefix(current_ids: Sequence[int], new_tokens: Sequence[int]) -> int:
+    def longest_token_prefix(
+        current_ids: Union[Sequence[int], npt.NDArray[np.intc]],
+        new_tokens: Union[Sequence[int], npt.NDArray[np.intc]]
+    ) -> int:
         """
         Calculates the length of the longest common prefix between two token sequences.
 
@@ -2647,13 +2675,11 @@ prompt: The prompt to generate text from.
             int: The number of matching tokens from the start.
         """
         # Fast exit for empty sequences to avoid unnecessary processing
-        if not current_ids or not new_tokens:
+        if len(current_ids) == 0 or len(new_tokens) == 0:
             return 0
 
         # Determine the comparison range (limited by the shorter sequence)
         min_len = min(len(current_ids), len(new_tokens))
-        if min_len == 0:
-            return 0
 
         # Probe inspection: Use Python to quickly compare the first token
         # If the tokens are different from the beginning, return immediately to avoid any NumPy overhead.
@@ -2663,8 +2689,8 @@ prompt: The prompt to generate text from.
         # Accelerating SIMD for Large Data Volumes
         # Only transform necessary slices, avoid processing irrelevant data
         # Use asarray to ensure zero-copy (if the input is already an array)
-        current_ids_array = np.asarray(current_ids[:min_len], dtype=np.int32)
-        new_tokens_array = np.asarray(new_tokens[:min_len], dtype=np.int32)
+        current_ids_array = np.asarray(current_ids[:min_len], dtype=np.intc)
+        new_tokens_array = np.asarray(new_tokens[:min_len], dtype=np.intc)
 
         # Perform vectorized element-wise comparison (SIMD instruction set usage)
         # Creates a boolean array where True indicates a match (e.g., [True, True, False, ...])

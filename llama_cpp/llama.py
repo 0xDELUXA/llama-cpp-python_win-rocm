@@ -34,10 +34,11 @@ from .llama_types import *
 from .llama_grammar import LlamaGrammar
 from .llama_cache import (
     BaseLlamaCache,
-    LlamaCache,      # type: ignore
-    LlamaDiskCache,  # type: ignore
-    LlamaRAMCache,   # type: ignore
-    LlamaTrieCache,  # type: ignore
+    LlamaCache,            # type: ignore
+    LlamaDiskCache,        # type: ignore
+    LlamaRAMCache,         # type: ignore
+    LlamaTrieCache,        # type: ignore
+    HybridCheckpointCache, # type: ignore
 )
 from .llama_tokenizer import BaseLlamaTokenizer, LlamaTokenizer
 import llama_cpp.llama_cpp as llama_cpp
@@ -84,6 +85,7 @@ class Llama:
         # Context Params
         seed: int = llama_cpp.LLAMA_DEFAULT_SEED,
         n_ctx: int = 512,
+        n_keep: int = 256,
         n_batch: int = 2048,
         n_ubatch: int = 512,
         n_seq_max: int = 1,
@@ -109,6 +111,9 @@ class Llama:
         op_offload: Optional[bool] = None,
         swa_full: Optional[bool] = None,
         kv_unified: Optional[bool] = None,
+        # HybridCheckpointCache Params
+        ctx_checkpoints: int = 32,
+        checkpoint_interval: int = 4096,
         # Sampling Params
         last_n_tokens_size: int = 64,
         # LoRA Params
@@ -174,6 +179,7 @@ class Llama:
             kv_overrides: Key-value overrides for the model.
             seed: RNG seed, -1 for random
             n_ctx: Text context, 0 = from model
+            n_keep: Number of tokens to keep from initial prompt
             n_batch: Prompt processing maximum batch size
             n_ubatch: Physical batch size
             n_seq_max: max number of sequences (i.e. distinct states for recurrent models)
@@ -197,6 +203,8 @@ class Llama:
             op_offload: whether to offload host tensor operations to device
             swa_full: whether to use full-size SWA cache
             kv_unified: use single unified KV buffer for the KV cache of all sequences
+            ctx_checkpoints: max number of context checkpoints to create per slot (default: 16)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)
+            checkpoint_interval: Hybrid model checkpoint token intervals, and archiving of text with interval sizes along the way.
             last_n_tokens_size: Maximum number of tokens to keep in the last_n_tokens deque.
             lora_base: Optional path to base model, useful if using a quantized base model and you want to apply LoRA to an f16 model.
             lora_path: Path to a LoRA file to apply to the model.
@@ -324,6 +332,7 @@ class Llama:
             self.model_params.kv_overrides = self._kv_overrides_array
 
         self.n_batch = min(n_ctx, n_batch)  # ???
+        self.n_keep = n_keep if n_keep > 0 else 256
         self.n_seq_max = n_seq_max
         self.n_threads = n_threads or max(multiprocessing.cpu_count() // 2, 1)
         self.n_threads_batch = n_threads_batch or multiprocessing.cpu_count()
@@ -465,6 +474,27 @@ class Llama:
                 )
             )
         )
+
+        # Hybrid architecture detection
+        _is_recurrent = self._model.is_recurrent()
+        _is_hybrid = self._model.is_hybrid()
+        _n_swa = self._model.n_swa()
+        # checkpoints are created only if:
+        # - the model uses SWA and we are not using `swa_full`
+        # - the model architecture is marked as recurrent or hybrid
+        self.is_hybrid = _is_recurrent or _is_hybrid or (_n_swa > 0 and not swa_full)
+
+        if self.is_hybrid:
+            if self.verbose:
+                print(f"Llama.__init__: Hybrid/Recurrent model detected."
+                      f"(is_recurrent: {_is_recurrent}, is_hybrid: {_is_hybrid}, n_swa: {_n_swa}, swa_full: {swa_full}). "
+                      f" Enabling HybridCheckpointCache(ctx_checkpoints={ctx_checkpoints}, checkpoint_interval={checkpoint_interval}).",
+                      file=sys.stderr)
+            self.ctx_checkpoints = ctx_checkpoints
+            self.checkpoint_interval = checkpoint_interval
+            self._hybrid_cache_mgr = HybridCheckpointCache(self._ctx.ctx, max_checkpoints=self.ctx_checkpoints, verbose=self.verbose)
+        else:
+            self._hybrid_cache_mgr = None
 
         self._batch = self._stack.enter_context(
             contextlib.closing(
@@ -634,6 +664,10 @@ class Llama:
             self._candidates.close()
             self._candidates = None
 
+        if getattr(self, "_hybrid_cache_mgr", None) is not None and hasattr(self._hybrid_cache_mgr, "close"):
+            self._hybrid_cache_mgr.close()
+            self._hybrid_cache_mgr = None
+
         if hasattr(self, "chat_handler") and hasattr(self.chat_handler, "close"):
             self.chat_handler.close()
 
@@ -641,13 +675,16 @@ class Llama:
         self.context_params = None
         self.chat_handler = None
         self.input_ids = None
+        self.metadata = None
         self.scores = None
         self.tokenizer_ = None
 
         self._c_tensor_split = None
         self._kv_overrides_array = None
 
-        self._stack.close()
+        if getattr(self, "_stack", None) is not None and hasattr(self._stack, "close"):
+            self._stack.close()
+            self._stack = None
 
     def __del__(self) -> None:
         self.close()
@@ -749,50 +786,183 @@ class Llama:
         if len(tokens) == 0:
             return
         n_eval = len(tokens)
-        current_pos = self.n_tokens
+        if n_eval == 0:
+            return
 
-        if self._ctx:
-            # Standard cleanup by current_pos
-            is_success = self._ctx.memory_seq_rm(0, current_pos, -1)
-            # Fallback: Broad cleanup
-            if not is_success:
-                if self.verbose:
-                    print(f"WARN: memory_seq_rm(0, {current_pos}, -1) failed. Executing fallback: memory_seq_rm(0, 0, -1)")
-                is_success = self._ctx.memory_seq_rm(0, 0, -1)
-
-        for i in range(0, n_eval, self.n_batch):
-            batch = tokens[i : min(n_eval, i + self.n_batch)]
-            n_past = self.n_tokens
-            n_batch_tokens = len(batch)
-            self._batch.set_batch(
-                batch=batch, n_past=n_past, logits_all=self._logits_all
-            )
-            try:
-                self._ctx.decode(self._batch)
-            except Exception as e:
+        # Context Shift: Prevent OOM by discarding older tokens when context limit is reached.
+        if self.n_tokens + n_eval > self._n_ctx:
+            # 0. Check if the memory supports shifting
+            if not self._ctx.memory_can_shift():
                 raise RuntimeError(
-                    f"Decode Failed at Pos {current_pos}. "
-                    f"Batch size: {n_batch_tokens}. "
-                    f"Result of memory_seq_rm: {is_success}. "
-                    f"Error: {str(e)}."
-                ) from e
-            # Save tokens
-            self.input_ids[n_past : n_past + n_batch_tokens] = batch
+                    f"Llama.eval: Context Shift is explicitly disabled by the C++ backend "
+                    f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
+                    f"You MUST increase n_ctx (currently {self._n_ctx}) to fit the dialogue."
+                )
+            # 1. Calculate the absolute minimum number of tokens we must discard to fit the new chunk.
+            required_discard = (self.n_tokens + n_eval) - self._n_ctx
 
-            # Save logits
-            logits_ptr = self._ctx.get_logits()
+            # 2. Sanity check: If the incoming chunk itself is larger than the entire context window,
+            # shifting is physically impossible.
+            if required_discard > self.n_tokens:
+                raise RuntimeError(f"Llama.eval: Context shift failed. The incoming chunk ({n_eval} tokens) "
+                                   f"is larger than the entire context window ({self._n_ctx}).")
+
+            # 3. Determine how many tokens to keep at the beginning (usually the System Prompt).
+            _n_keep_desired = min(self.n_keep, self.n_tokens)
+
+            # Ensure that keeping these tokens doesn't prevent us from discarding the required amount.
+            max_keep_allowed = max(0, self.n_tokens - required_discard)
+            _n_keep = min(_n_keep_desired, max_keep_allowed)
+
+            # 4. Calculate the final discard count. Default strategy is to discard half of the available
+            # past tokens to minimize frequent shifting, but it must be at least `required_discard`.
+            _n_discard = max(required_discard, (self.n_tokens - _n_keep) // 2)
+
+            # 5. Execute the shift only if there are tokens to discard.
+            if _n_discard > 0:
+                if self.verbose:
+                    model_type = "Hybrid/Recurrent/SWA" if getattr(self, 'is_hybrid', False) else "Transformer"
+                    print(f"Llama.eval: {model_type} context limit reached. Shifting context: "
+                          f"keeping {_n_keep}, discarding {_n_discard} tokens...", file=sys.stderr)
+
+                try:
+                    # Remove the specified block of tokens from the physical KV cache
+                    self._ctx.memory_seq_rm(0, _n_keep, _n_keep + _n_discard)
+
+                    # Shift the positional IDs of all subsequent tokens to the left to close the gap
+                    self._ctx.memory_seq_add(0, _n_keep + _n_discard, self.n_tokens, -_n_discard)
+                except Exception as e:
+                    # Defense-in-depth: Catch any other recoverable backend errors
+                    raise RuntimeError(f"Llama.eval: Context Shift failed at the C++ level. Error: {str(e)}") from e
+
+                # 6. Synchronize the Python-side token tracking array (ledger)
+                remaining_len = self.n_tokens - (_n_keep + _n_discard)
+                if remaining_len > 0:
+                    self.input_ids[_n_keep : _n_keep + remaining_len] = self.input_ids[_n_keep + _n_discard : self.n_tokens]
+
+                # 7. Update the global token counter
+                self.n_tokens -= _n_discard
+
+        # Adaptive batch downgrade limit initialization
+        current_max_batch = self.n_batch
+        last_ckpt_pos = self.n_tokens
+
+        # Adaptive Periodic Checkpointing for Hybrid Models
+        # Following the "no more than three times" principle :)
+        # when pre-filling very large blocks, dilute the save frequency to minimize I/O blocking.
+        if self.is_hybrid and self._hybrid_cache_mgr is not None:
+            dynamic_interval = max(self.checkpoint_interval, n_eval // 3)  # Maximum of 3 triggers
+
+        # If KV slots are full, `current_batch_size` will be halved.
+        # A `while` loop allows us to correctly resume from the exact cut-off point.
+        i = 0
+        while i < n_eval:
+            # Chunk the tokens using the adaptive current_max_batch
+            n_chunk = min(n_eval - i, current_max_batch)
+            chunk = tokens[i : i + n_chunk]
+            n_past = self.n_tokens
+
+            self._batch.reset()
+
+            pos_array = [self.n_tokens + j for j in range(n_chunk)]
+
+            # Configure logits extraction:
+            # If _logits_all is True, calculate for every token.
+            # Otherwise, only calculate for the very last token in the entire evaluation sequence.
             if self._logits_all:
-                rows = n_batch_tokens
+                logits_array = [True] * n_chunk
+            else:
+                logits_array = [False] * n_chunk
+                if i + n_chunk == n_eval:
+                    logits_array[-1] = True
+
+            self._batch.add_sequence(
+                token_array=chunk,
+                pos_array=pos_array,
+                seq_ids=[0],
+                logits_array=logits_array
+            )
+
+            # Dynamic Batch Downgrade: Attempt to decode, reduce batch size if KV cache is fragmented
+            current_batch_size = n_chunk
+            success = False
+
+            while current_batch_size > 0:
+                # Tell the C++ backend to only process up to `current_batch_size` tokens
+                self._batch.batch.n_tokens = current_batch_size
+
+                try:
+                    status = self._ctx.decode(self._batch)
+
+                    # 0: Success
+                    if status == 0:
+                        success = True
+                        # If we successfully decoded after a downgrade,
+                        # update current_max_batch to prevent repeated failures in next iterations.
+                        if current_batch_size < current_max_batch:
+                            current_max_batch = current_batch_size
+                        break
+
+                    # 1: No KV slot available (Recoverable)
+                    elif status == 1:
+                        if current_batch_size == 1:
+                            if self.verbose:
+                                print("Llama.eval: KV slots completely full. "
+                                      "Cannot reduce batch size below 1. Aborting...", file=sys.stderr)
+                            break
+                        if self.verbose:
+                            print(f"Llama.eval: KV slots full (Code 1). Halving batch size "
+                                  f"from {current_batch_size} to {current_batch_size // 2}...", file=sys.stderr)
+                        current_batch_size //= 2
+
+                except Exception as e:
+                    # Catch fatal backend failures (e.g., Code -2, -3)
+                    raise RuntimeError(f"Llama.eval(decode): Fatal Decode Error at Pos {self.n_tokens}, "
+                                       f"Batch size {current_batch_size}: {str(e)}") from e
+
+            if not success:
+                raise RuntimeError("Llama.eval(decode): Failed completely even with batch size 1.")
+
+            # Save successfully processed tokens into the Python-side ledger
+            self.input_ids[n_past : n_past + current_batch_size] = chunk[:current_batch_size]
+
+            # Extract and save all logits if requested, ensuring we only copy the successfully processed rows
+            if self._logits_all:
+                logits_ptr = self._ctx.get_logits()
+                rows = current_batch_size
                 cols = self._n_vocab
                 logits_view = np.ctypeslib.as_array(logits_ptr, shape=(rows * cols,))
-                self.scores[n_past : n_past + n_batch_tokens, :].reshape(-1)[:] = logits_view
-            else:
-                logits_view = np.ctypeslib.as_array(logits_ptr, shape=(self._n_vocab,))
-                self.scores[0, :] = logits_view
+                self.scores[n_past : n_past + current_batch_size, :].reshape(-1)[:] = logits_view
 
-            # Update n_tokens
-            current_pos += n_batch_tokens
-            self.n_tokens = current_pos
+            # Update indices based on actual processed batch size
+            self.n_tokens += current_batch_size
+            i += current_batch_size
+
+            # Periodic Checkpoint: Save states for hybrid models to avoid massive rollbacks
+            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                current_pos = self.n_tokens
+                if (current_pos - last_ckpt_pos >= dynamic_interval) and (i < n_eval):
+
+                    if self.verbose:
+                        print(f"Llama.eval: [Periodic Checkpoint] Saving hybrid state at pos {current_pos} "
+                              f"(checkpoint_interval({dynamic_interval}) reached, last={last_ckpt_pos}).", file=sys.stderr)
+
+                    success = self._hybrid_cache_mgr.save_checkpoint(
+                        current_pos=current_pos,
+                        tokens=self.input_ids[:current_pos].tolist(),
+                        seq_id=0
+                    )
+                    if success:
+                        last_ckpt_pos = current_pos
+                    else:
+                        if self.verbose:
+                            print(f"Llama.eval: [Periodic Checkpoint] HybridCheckpoint save failed at pos {current_pos}, skipping update", file=sys.stderr)
+
+        # Save the final logit if not in _logits_all mode
+        if not self._logits_all:
+            logits_ptr = self._ctx.get_logits()
+            logits_view = np.ctypeslib.as_array(logits_ptr, shape=(self._n_vocab,))
+            self.scores[0, :] = logits_view
 
     # Helper method: Convert dict logit_bias to List[llama_logit_bias]
     def _convert_logit_bias(self, logit_bias: Optional[Dict[int, float]]) -> List[llama_cpp.llama_logit_bias]:
@@ -997,6 +1167,63 @@ class Llama:
         Yields:
             The generated tokens.
         """
+        original_tokens = list(tokens)
+        # Check for kv cache prefix match
+        if reset and self.n_tokens > 0:
+            longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
+            if longest_prefix > 0:
+                reset = False
+
+                if longest_prefix == len(tokens):
+                    if self.verbose:
+                        print(f"Llama.generate: Full match. Forcing prefix-- to evaluate 1 token.", file=sys.stderr)
+                    longest_prefix -= 1
+
+                # Physically erase trailing "ghost" tokens from the C++ KV cache
+                # to prevent attention misalignment in multi-round chats.
+                if longest_prefix < self.n_tokens:
+                    if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                        if self.verbose:
+                            print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
+
+                        best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, 0)
+                        if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                            actual_prefix = best_ckpt.pos
+                        else:
+                            actual_prefix = 0
+                            self._hybrid_cache_mgr.clear()
+                            self._ctx.memory_clear(True)
+
+                        self.n_tokens = actual_prefix
+                        tokens = original_tokens[actual_prefix:]
+                        if self.verbose:
+                            print(
+                                f"Llama.generate: {actual_prefix} prefix-match hit, "
+                                f"remaining {len(tokens)} prompt tokens to eval",
+                                file=sys.stderr,
+                            )
+                    else:
+                        if self.verbose:
+                            print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
+                        self._ctx.memory_seq_rm(0, longest_prefix, -1)
+
+                        # Adjust the tokens array and cursor to reuse the matched cache
+                        self.n_tokens = longest_prefix
+                        tokens = tokens[longest_prefix:]
+
+                        if self.verbose:
+                            print(
+                                f"Llama.generate: {longest_prefix} prefix-match hit, "
+                                f"remaining {len(tokens)} prompt tokens to eval",
+                                file=sys.stderr,
+                            )
+            else:
+                # No prefix matched. Completely clear the KV cache to prevent context poisoning.
+                self.n_tokens = 0
+                self._ctx.memory_clear(True)
+                if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                    self._hybrid_cache_mgr.clear()
+
         # Reset mirostat sampling
         params = LlamaSamplingParams(
             # Core Sampling
@@ -1072,86 +1299,104 @@ class Llama:
 
         self._sampling_ctx = LlamaSamplingContext(params, self._model)
 
-        # Check for kv cache prefix match
-        if reset and self.n_tokens > 0:
-            longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
-            if longest_prefix > 0:
-                reset = False
-
-                # Physically erase trailing "ghost" tokens from the C++ KV cache
-                # to prevent attention misalignment in multi-round chats.
-                if longest_prefix < self.n_tokens:
-                    if self.verbose:
-                        print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
-                    self._ctx.memory_seq_rm(0, longest_prefix, -1)
-
-                # Adjust the tokens array and cursor to reuse the matched cache
-                tokens = tokens[longest_prefix:]
-                self.n_tokens = longest_prefix
-
-                if self.verbose:
-                    print(
-                        f"Llama.generate: {longest_prefix} prefix-match hit, "
-                        f"remaining {len(tokens)} prompt tokens to eval",
-                        file=sys.stderr,
-                    )
-            else:
-                # No prefix matched. Completely clear the KV cache to prevent context poisoning.
-                self.n_tokens = 0
-                self._ctx.memory_clear(True)
-
-        # Reset the model state
-        if reset:
-            self.reset()
-
         sample_idx = self.n_tokens + len(tokens) - 1
         tokens = list(tokens)
 
         # Eval and sample
-        while True:
-            self.eval(tokens)
-            while sample_idx < self.n_tokens:
-                token = self._sampling_ctx.sample(self._ctx, idx=-1)
-                self._sampling_ctx.accept(token, False if grammar is None else True)
+        try:
+            while True:
+                if len(tokens) > 0:
+                    # For hybrid models processing a prompt (len > 1), force an N-1 checkpoint
+                    # to safely allow 1-token rollbacks (e.g., for seed changes on 100% prompt matches).
+                    if self.is_hybrid and self._hybrid_cache_mgr is not None and len(tokens) > 1:
+                        body_tokens = tokens[:-1]
+                        last_token = [tokens[-1]]
 
-                sample_idx += 1
-                if stopping_criteria is not None:
-                    if self._logits_all:
-                        logits_idx = sample_idx - self.n_tokens
-                        check_stopping = True
+                        # 1. Evaluate up to N-1
+                        self.eval(body_tokens)
+
+                        # 2. Save the N-1 state snapshot
+                        current_history = self._input_ids[:self.n_tokens].tolist()
+                        self._hybrid_cache_mgr.save_checkpoint(
+                            current_pos=self.n_tokens,
+                            tokens=current_history,
+                            seq_id=0
+                        )
+                        # 3. Evaluate the final token to refresh logits
+                        self.eval(last_token)
                     else:
-                        if sample_idx == self.n_tokens:
-                            logits_idx = 0
+                        # Standard evaluation or single-token generation step
+                        self.eval(tokens)
+                while sample_idx < self.n_tokens:
+                    token = self._sampling_ctx.sample(self._ctx, idx=-1)
+                    self._sampling_ctx.accept(token, False if grammar is None else True)
+
+                    sample_idx += 1
+
+                    if stopping_criteria is not None:
+                        if self._logits_all:
+                            logits_idx = sample_idx - self.n_tokens
                             check_stopping = True
                         else:
-                            check_stopping = False
+                            if sample_idx == self.n_tokens:
+                                logits_idx = 0
+                                check_stopping = True
+                            else:
+                                check_stopping = False
 
-                    if check_stopping and stopping_criteria(
-                        self._input_ids[: sample_idx],
-                        self._scores[logits_idx, :]
-                    ):
-                        return
-                tokens_or_none = yield token
-                tokens.clear()
-                tokens.append(token)
+                        if check_stopping and stopping_criteria(
+                            self._input_ids[: sample_idx],
+                            self._scores[logits_idx, :]
+                        ):
+                            return
 
-                if tokens_or_none is not None:
-                    tokens.extend(tokens_or_none)
+                    tokens_or_none = yield token
+                    tokens.clear()
+                    tokens.append(token)
 
-                if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
-                    self.n_tokens = sample_idx
-                    self._ctx.memory_seq_rm(0, self.n_tokens, -1)
-                    break
+                    if tokens_or_none is not None:
+                        tokens.extend(tokens_or_none)
 
-            if self.draft_model is not None:
-                self.input_ids[self.n_tokens : self.n_tokens + len(tokens)] = tokens
-                draft_tokens = self.draft_model(
-                    self.input_ids[: self.n_tokens + len(tokens)]
-                )
-                tokens.extend(
-                    draft_tokens.astype(int)[
-                        : self._n_ctx - self.n_tokens - len(tokens)
-                    ]
+                    if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
+                        self.n_tokens = sample_idx
+                        if self.is_hybrid:
+                            if self.verbose:
+                                print("Llama.generate: Draft token rejected for Hybrid model. Rolling back via Checkpoint.", file=sys.stderr)
+                            if self._hybrid_cache_mgr:
+                                best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(self._input_ids[:self.n_tokens].tolist(), 0)
+                                if best_ckpt and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                                    self.n_tokens = best_ckpt.pos
+                                else:
+                                    self._hybrid_cache_mgr.clear()
+                                    self._ctx.memory_clear(True)
+                                    self.n_tokens = 0
+                        else:
+                            self._ctx.memory_seq_rm(0, self.n_tokens, -1)
+
+                        break
+
+                if self.draft_model is not None:
+                    if self.is_hybrid:
+                        if self.verbose:
+                            print("Llama.generate: Speculative decoding is skipped for Hybrid models.", file=sys.stderr)
+                    else:
+                        self.input_ids[self.n_tokens : self.n_tokens + len(tokens)] = tokens
+                        draft_tokens = self.draft_model(
+                            self.input_ids[: self.n_tokens + len(tokens)]
+                        )
+                        tokens.extend(
+                            draft_tokens.astype(int)[
+                                : self._n_ctx - self.n_tokens - len(tokens)
+                            ]
+                        )
+        finally:
+            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                current_history = self._input_ids[:self.n_tokens].tolist()
+
+                self._hybrid_cache_mgr.save_checkpoint(
+                    current_pos=self.n_tokens,
+                    tokens=current_history,
+                    seq_id=0
                 )
 
     def create_embedding(

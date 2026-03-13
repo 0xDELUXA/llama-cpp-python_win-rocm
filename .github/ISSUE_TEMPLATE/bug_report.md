@@ -1,96 +1,113 @@
 ---
-name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
-assignees: ''
+name: 🚀 Bug Report (Efficiency & Runtime)
+about: Report a runtime crash, logic error, or performance issue.
+title: "[Bug]: <Brief description of the issue>"
+labels: ["bug", "triage"]
+assignees: ""
+---
+
+### ⚠️ IMPORTANT: HUMAN-ONLY SUBMISSION POLICY
+
+**AI-generated Issues or Pull Requests will be closed without review.**
+- Please use AI(artificial intelligence) only as a auxiliary tool to assist in brainstorming, code analysis, or adding comments.
+- A human developer must verify the accuracy, necessity, and urgency of this report before submission.
+- It's cool to learn about AI and how it works through a project to improve yourself, right? ;)
+---
+
+### Prerequisites
+
+* [ ] I am running the latest code from the **JamePeng/llama-cpp-python** branch.
+* [ ] I carefully followed the [README.md](https://github.com/JamePeng/llama-cpp-python/blob/main/README.md).
+* [ ] I have verified the issue is not a duplicate.
+* [ ] I have tested it using the official binary `llama-cli` or `llama-server` provided by `llama.cpp`, and the problem (exists/does not exist) still exists.
+* [ ] I reviewed the [Discussions](https://github.com/JamePeng/llama-cpp-python/discussions), and have a new bug or useful enhancement to share.
+
+### Environment & Hardware Configuration
+
+Please provide your specific setup. Use the suggested commands for your OS to verify.
+
+| Category | Windows 10/11 | Ubuntu / Linux | macOS 15/18/26+ |
+| --- | --- | --- | --- |
+| **OS Version** | `winver` or System > About | `lsb_release -a` | `sw_vers` |
+| **CPU** | Task Manager > Performance | `lscpu` | `sysctl -n machdep.cpu.brand_string` |
+| **RAM Size** | Task Manager > Performance | `free -h` | Activity Monitor > Memory |
+| **GPU/Multi-Card** | Device Manager / `nvidia-smi` | `nvidia-smi` or `lspci` | System Report > Graphics/Displays |
+
+* **Multi-GPU Setup**: (e.g., 2x RTX 4090 / SLI / None)
+* **Specific Hardware Screenshots**: [Insert screenshot of Task Manager / `nvidia-smi` / System Info here]
+
+### Toolchain Versions
+
+Provide the exact versions or commit hashes:
+
+* **Python**: `python --version`
+* **Python Library**: `pip list`
+* **Compiler**: (e.g., `g++ --version`, `msvc` via VS Installer, or `xcode-select -v`)
+* **llama-cpp-python Commit**: `git rev-parse HEAD`
+* **vendor/llama.cpp Commit**: `cd vendor/llama.cpp && git rev-parse HEAD`
+
+### Model & Logic Context
+
+* **Model Source**: (e.g., HuggingFace, ModelScope, Custom Conversion)
+* **Model Path**: `Qwen3.5-9B-Q4_K_M.gguf`
+* **Multimodal Path**: `mmproj-BF16.gguf` (if applicable)
+
+### Failure Timing & Logs
+
+**Is the issue occurring during Build (Compilation) or Runtime?**
+
+#### Runtime Debugging Requirement:
+
+When reporting a runtime bug, you **must** set `verbose=True` in both the `Llama` class and the `ChatHandler` to capture internal logs.
+
+```python
+# Required Debugging Configuration
+llm = Llama(
+    model_path="./Qwen3.5-9B-Q4_K_M.gguf",
+    chat_handler=Qwen35ChatHandler(
+        clip_model_path="./mmproj-BF16.gguf",
+        enable_thinking=True,
+        verbose=True  # SET TO TRUE
+    ),
+    n_gpu_layers=-1,
+    n_ctx=40960,
+    verbose=True,      # SET TO TRUE
+    ctx_checkpoints=0
+)
+
+```
+
+### Steps to Reproduce & Reproduction Logic
+
+1. Provide the full `CMAKE_ARGS` used during installation (e.g., `CMAKE_ARGS="-DGGML_CUDA=ON" pip install .`).
+2. Provide the full runtime Python script.
+    - If privacy is a concern, `pseudo-paths` and `business logic code` can be used to hide the script, while preserving the initialization and runtime code surrounding bug triggers. 
+    - Relatively complete code is best for tracking issues. Your choice :)
+3. **Reproduction Screenshot**: [Insert screenshot of the error or the unexpected behavior here]
+
+### Analysis & Brainstorming
+
+> Use this section to include any insights gained from AI-assisted code analysis or your own/team's brainstorming.
+
+* **Potential Root Cause**: (e.g., buffer overflows, inaccurate memory releases, kv cache management, unnecessary memory allocations, redundant mergeable runtime logic, etc.)
+* **Code Comments/Fix Ideas**: (Paste analyzed code snippets with your added comments)
+
+```text
+<PASTE ANALYSIS OR EXPLANATION HERE>
+
+```
 
 ---
 
-# Prerequisites
+### Expected Behavior
 
-Please answer the following questions for yourself before submitting an issue.
+Describe the expected outcome.
 
-- [ ] I am running the latest code. Development is very rapid so there are no tagged versions as of now.
-- [ ] I carefully followed the [README.md](https://github.com/abetlen/llama-cpp-python/blob/main/README.md).
-- [ ] I [searched using keywords relevant to my issue](https://docs.github.com/en/issues/tracking-your-work-with-issues/filtering-and-searching-issues-and-pull-requests) to make sure that I am creating a new issue that is not already open (or closed).
-- [ ] I reviewed the [Discussions](https://github.com/abetlen/llama-cpp-python/discussions), and have a new bug or useful enhancement to share.
+### Current Behavior
 
-# Expected Behavior
+Describe the actual outcome and paste the **Verbose Logs** below:
 
-Please provide a detailed written description of what you were trying to do, and what you expected `llama-cpp-python` to do.
+```text
+<PASTE FULL VERBOSE LOGS HERE>
 
-# Current Behavior
-
-Please provide a detailed written description of what `llama-cpp-python` did, instead.
-
-# Environment and Context
-
-Please provide detailed information about your computer setup. This is important in case the issue is not reproducible except for under certain specific conditions.
-
-* Physical (or virtual) hardware you are using, e.g. for Linux:
-
-`$ lscpu`
-
-* Operating System, e.g. for Linux:
-
-`$ uname -a`
-
-* SDK version, e.g. for Linux:
-
-```
-$ python3 --version
-$ make --version
-$ g++ --version
-```
-
-# Failure Information (for bugs)
-
-Please help provide information about the failure if this is a bug. If it is not a bug, please remove the rest of this template.
-
-# Steps to Reproduce
-
-Please provide detailed steps for reproducing the issue. We are not sitting in front of your screen, so the more detail the better.
-
-1. step 1
-2. step 2
-3. step 3
-4. etc.
-
-**Note: Many issues seem to be regarding functional or performance issues / differences with `llama.cpp`. In these cases we need to confirm that you're comparing against the version of `llama.cpp` that was built with your python package, and which parameters you're passing to the context.**
-
-Try the following:
-
-1. `git clone https://github.com/abetlen/llama-cpp-python`
-2. `cd llama-cpp-python`
-3. `rm -rf _skbuild/` # delete any old builds
-4. `python -m pip install .`
-5. `cd ./vendor/llama.cpp`
-6. Follow [llama.cpp's instructions](https://github.com/ggerganov/llama.cpp#build) to `cmake` llama.cpp
-7. Run llama.cpp's `./main` with the same arguments you previously passed to llama-cpp-python and see if you can reproduce the issue. If you can, [log an issue with llama.cpp](https://github.com/ggerganov/llama.cpp/issues)
-
-# Failure Logs
-
-Please include any relevant log snippets or files. If it works under one configuration but not under another, please provide logs for both configurations and their corresponding outputs so it is easy to see where behavior changes.
-
-Also, please try to **avoid using screenshots** if at all possible. Instead, copy/paste the console output and use [Github's markdown](https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax) to cleanly format your logs for easy readability.
-
-Example environment info:
-```
-llama-cpp-python$ git log | head -1
-commit 47b0aa6e957b93dbe2c29d53af16fbae2dd628f2
-
-llama-cpp-python$ python3 --version
-Python 3.10.10
-
-llama-cpp-python$ pip list | egrep "uvicorn|fastapi|sse-starlette|numpy"
-fastapi                  0.95.0
-numpy                    1.24.3
-sse-starlette            1.3.3
-uvicorn                  0.21.1
-
-llama-cpp-python/vendor/llama.cpp$ git log | head -3
-commit 66874d4fbcc7866377246efbcee938e8cc9c7d76
-Author: Kerfuffle <44031344+KerfuffleV2@users.noreply.github.com>
-Date:   Thu May 25 20:18:01 2023 -0600
 ```

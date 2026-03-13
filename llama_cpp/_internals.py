@@ -1099,6 +1099,7 @@ class LlamaSamplingContext:
 
         # reusable numpy logits view
         self._logits_view = None
+        self._logits_ptr_addr = None
 
         self._single_token = llama_cpp.llama_token_data()
         self._single_array = llama_cpp.llama_token_data_array(
@@ -1281,12 +1282,14 @@ class LlamaSamplingContext:
 
         # 3. build cur_p
         logits_ptr = llama_cpp.llama_get_logits_ith(ctx.ctx, idx)
+        cur_addr = ctypes.addressof(logits_ptr.contents)
 
-        if self._logits_view is None:
+        if self._logits_ptr_addr != cur_addr:
             self._logits_view = np.ctypeslib.as_array(
                 logits_ptr,
                 shape=(self.n_vocab,),
             )
+            self._logits_ptr_addr = cur_addr
 
         logits_array = self._logits_view
         cur_p = self._cur_p
@@ -1395,6 +1398,7 @@ class LlamaSamplingContext:
 
         # Remove NumPy view pointing to llama logits buffer.
         self._logits_view = None
+        self._logits_ptr_addr = None
 
         # Break references to small C structs used in grammar rejection sampling.
         self._single_token = None

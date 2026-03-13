@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.32] Hybrid/Multimodal Model Single-Turn Optimizations & Fix Sampling Seed
+
+- perf(hybrid): optimize multimodal single-turn and fix KV clear bug
+    - Added a 100% match "FAST PATH" in Llama.generate to bypass N-1 truncation for hybrid models when caching is disabled.
+    - Fixed a bug where failed rollbacks on disabled caches would wipe the KV cache, causing multimodal pseudo-token crashes.
+    - Updated MTMDChatHandler to suppress cache-related logs and anchoring logic when max_checkpoints <= 0.
+
+- perf(hybrid): prevent expensive array slicing when cache is disabled
+    - Added a `max_checkpoints > 0` check to the `finally` block of the generation loop.
+    - Previously, even though the underlying C++ state extraction was bypassed, the Python layer was still executing `self._input_ids[:self.n_tokens].tolist()`. For long contexts, slicing and converting this massive array to a Python list caused unnecessary CPU overhead and garbage collection (GC) pressure. This intercept acts as a double-layer isolation, ensuring absolute zero memory allocation and zero overhead for hybrid models running in single-turn mode.
+
+- perf(hybrid): bypass N-1 evaluation split if max_checkpoints is 0
+    - Prevent fragmenting the prompt evaluation into `len(tokens)-1` and `1` when hybrid caching is disabled.
+    - Allows the underlying C++ engine to process the entire prompt in a single, efficient batch for single-turn workflows.
+
+- perf(hybrid): eliminate PCIe I/O latency for single-turn workflows
+    - This commit introduces critical performance optimizations and log tracing improvements for HybridCheckpointCache in single-turn workflows (e.g., ComfyUI or single-turn conversation mode):
+        - Now support 0 HybridCheckpointCache for single-turn conversation.(set the `ctx_checkpoints=0` when llama init )
+        - Added early-exit intercepts for `max_checkpoints <= 0` in `save_checkpoint` and `find_best_checkpoint`. This prevents massive (e.g., 150MB+) synchronous VRAM-to-RAM state extractions over the PCIe bus when rollback capabilities are disabled, eliminating a ~3-second blocking delay at the end of generation.
+        - Added a non-empty check in `clear()` to prevent log spam when the cache is already empty or disabled.
+        - Standardized logging prefixes (e.g., `HybridCheckpointCache(save_checkpoint)`) for better observability.
+        - Fixed a potential `UnicodeEncodeError` hazard in warning logs by replacing a non-standard arrow character with standard ASCII (`->`).
+
+- fix(sampling): pass seed to sampling context and remove global mutation
+    - Add `seed` parameter to `generate` and `sample` method signatures.
+    - Pass the resolved seed directly to `LlamaSamplingParams` to ensure the underlying C++ sampler uses it.
+    - Remove thread-unsafe `self.set_seed()` calls in `_create_completion` to prevent global state pollution during concurrent requests.
+
+- docs(issue-template): modernize bug report for efficiency
+    - Completely revamped the legacy bug report template to streamline troubleshooting. Added an anti-AI-spam policy, a detailed OS/Hardware matrix, forced `verbose=True` logging requirements with code examples, and new sections for model parameters and AI-assisted brainstorming.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/b283f6d5b3d2d079019ae5ed3cbbdb4b3be03b25](https://github.com/ggml-org/llama.cpp/commit/b283f6d5b3d2d079019ae5ed3cbbdb4b3be03b25)
+
+## [0.3.31] Omni-Modal Media Pipeline, Hybrid 1-Token Rollback and Enhanced Logging
+
+- refactor(mtmd): introduce omni-modal media pipeline with experimental audio support
+This commit significantly overhauls the media parsing and loading pipeline in `MTMDChatHandler` to gracefully handle both vision and audio inputs, establishing a true omni-modal architecture.
+
+    Key structural changes:
+    - Hardware Capability Sniffing: `_init_mtmd_context` now actively probes the C++ backend for `ctx_v` (vision) and `ctx_a` (audio) encoders, enabling proactive fail-fast validation before media processing.
+    - Unified Media Extraction: Replaced `get_image_urls` and `split_text_on_image_urls` with a robust `_get_media_items` method. This safely parses `image_url`, `input_audio`, and `audio_url` while strictly maintaining the chronological order of user prompts and enforcing OpenAI format specs.
+    - Media Dispatcher & Magic Bytes: Introduced a unified `load_media` dispatcher. Added a new `_load_audio` method and a rigorous `detect_audio_format` static method that accurately mimics `llama.cpp`'s C++ magic bytes sniffing (RIFF/WAVE, ID3/MPEG, fLaC) to prevent fatal backend crashes.
+    - Concurrent Omni-Decoding: The ThreadPoolExecutor in `_process_mtmd_prompt` has been upgraded to concurrently fetch and decode both image and audio payloads into unified `mtmd_bitmap` structures.
+
+    - **Note**: Audio processing capabilities in the underlying llama.cpp engine are currently in an experimental stage.
+
+- fix(hybrid): implement N-1 checkpointing to support 1-token rollbacks
+    - Forces an N-1 state snapshot during prompt prefilling for hybrid models. This ensures the engine can safely perform a 1-token rollback to refresh logits upon 100% cache matches (e.g., changing seeds on identical prompts), preventing RNN state desyncs and empty outputs.
+
+    - **Note**: For the Comfyui plugin developer, I recommend performing a reset operation before inputting the prompt word. This way, the seed will be included as one of the factors in the initial complete recalculation.
+
+- fix(mtmd): remove OS-level log suppression to expose critical C++ errors
+    - Removed the `suppress_stdout_stderr` context manager around critical C++ backend calls (`_init_mtmd_context`, `_create_bitmap_from_bytes`, and `close`).
+
+    - Previously, when `verbose=False`, this OS-level file descriptor redirection was swallowing fatal C++ backend errors (e.g., `stb_image` decoding failures, corrupted `.mmproj` model weights, or CUDA Out-Of-Memory aborts), resulting in silent crashes that were impossible to debug. The framework now correctly relies on the native C-API `llama_log_callback` to route logs to Python gracefully, ensuring that critical decoding and hardware exceptions remain visible to the developer.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/f5ddcd1696eca5069dc7915f4d4c03c9a709afea](https://github.com/ggml-org/llama.cpp/commit/f5ddcd1696eca5069dc7915f4d4c03c9a709afea)
+
 ## [0.3.30] Milestone Release
 
 I will update the release notes for version 0.3.30 in the [discussion](https://github.com/JamePeng/llama-cpp-python/discussions).

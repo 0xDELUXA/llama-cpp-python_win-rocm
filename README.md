@@ -5,9 +5,8 @@
 #  Python Bindings for [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
 
 [![Documentation Status](https://readthedocs.org/projects/llama-cpp-python/badge/?version=latest)](https://llama-cpp-python.readthedocs.io/en/latest/?badge=latest)
-[![Tests](https://github.com/abetlen/llama-cpp-python/actions/workflows/test.yaml/badge.svg?branch=main)](https://github.com/abetlen/llama-cpp-python/actions/workflows/test.yaml)
+[![Tests](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml/badge.svg?branch=main)](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml)
 ![GitHub Tag](https://img.shields.io/github/v/tag/JamePeng/llama-cpp-python)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/llama-cpp-python)](https://pypi.org/project/llama-cpp-python/)
 [![PyPI - License](https://img.shields.io/pypi/l/llama-cpp-python)](https://pypi.org/project/llama-cpp-python/)
 [![PyPI - Downloads](https://static.pepy.tech/badge/llama-cpp-python/month)](https://pepy.tech/projects/llama-cpp-python)
 [![Github All Releases](https://img.shields.io/github/downloads/abetlen/llama-cpp-python/total.svg?label=Github%20Downloads)]()
@@ -613,7 +612,108 @@ llm = Llama.from_pretrained(
 **NOTE**: There is no need to provide the default system messages used in Functionary as they are added automatically in the Functionary chat handler. Thus, the messages should contain just the chat messages and/or system messages that provide additional context for the model (e.g.: datetime, etc.).
 </details>
 
-### Multi-modal Models
+---
+
+##  Sampling Configuration & Usage (LlamaSamplingParams)
+
+The `Llama` class provides extensive control over the `llama.cpp` sampling chain during text generation. You can configure state-of-the-art sampling algorithms, dynamic temperature, and advanced repetition penalties directly via the `generate`, `create_completion`, or `__call__` methods.
+
+### Core Sampling Parameters
+
+These are the most common parameters used to control the randomness and focus of the model's output.
+
+* **`temperature`** (`float`, default: `0.80`): Controls the randomness of the generation. Higher values (e.g., `1.0`) make output more random, while lower values (e.g., `0.2`) make it more deterministic. Set to `<= 0.0` for greedy decoding.
+* **`top_k`** (`int`, default: `40`): Limits the next token selection to the K most probable tokens. Set to `<= 0` to use the full vocabulary size.
+* **`top_p`** (`float`, default: `0.95`): Nucleus sampling. Limits selection to a cumulative probability of P. Set to `1.0` to disable.
+* **`min_p`** (`float`, default: `0.05`): Minimum P sampling. Drops tokens with a probability less than `min_p` relative to the most likely token. Set to `0.0` to disable.
+* **`typical_p`** (`float`, default: `1.0`): Locally typical sampling. Adjusts probabilities based on the entropy of the distribution. Set to `1.0` to disable.
+
+
+### Advanced & Experimental Samplers
+
+* **XTC (Exclude Top Choice)**: Removes the most likely tokens to force the model to take creative alternative paths.
+* **`xtc_probability`** (`float`, default: `0.0`): The chance for token removal. `0.0` disables XTC.
+* **`xtc_threshold`** (`float`, default: `0.1`): The minimum probability threshold for a token to be considered for removal.
+
+
+* **Dynamic Temperature**: Adjusts the temperature dynamically based on the entropy of the current token distribution.
+* **`dynatemp_range`** (`float`, default: `0.0`): The range of the dynamic temperature. `0.0` disables it.
+* **`dynatemp_exponent`** (`float`, default: `1.0`): Controls how entropy maps to temperature.
+
+
+* **`top_n_sigma`** (`float`, default: `-1.0`): Limits selection to tokens with pre-softmax logits within $n * \sigma$ of the max logit. Set to `-1.0` to disable.
+* **Adaptive-P**: Dynamically adjusts the target probability using an exponential moving average (EMA).
+* **`adaptive_target`** (`float`, default: `-1.0`): The target probability (0.0 to 1.0). Negative values disable it.
+* **`adaptive_decay`** (`float`, default: `0.9`): The EMA decay rate (0.0 to 0.99).
+
+
+### Target Entropy (Mirostat)
+
+Mirostat actively maintains a target entropy (`tau`) during generation to prevent text from becoming too boring or too chaotic.
+
+* **`mirostat_mode`** (`int`, default: `0`): `0` = disabled, `1` = Mirostat 1.0, `2` = Mirostat 2.0.
+* **`mirostat_tau`** (`float`, default: `5.0`): The target cross-entropy (surprisal) value.
+* **`mirostat_eta`** (`float`, default: `0.1`): The learning rate used to update the algorithm's internal state.
+
+
+### Repetition Penalties
+
+* **Standard Penalties**:
+* **`repeat_penalty`** (`float`, default: `1.0`): General penalty for repeated tokens. `1.0` = disabled.
+* **`frequency_penalty`** (`float`, default: `0.0`): Penalty based on the absolute frequency of a token in the prompt.
+* **`present_penalty`** (`float`, default: `0.0`): Flat penalty applied if a token is present anywhere in the context.
+* **`penalty_last_n`** (`int`, default: `64`): The number of recent tokens to consider for standard penalties. `0` = disabled, `-1` = full context size.
+
+
+* **DRY (Don't Repeat Yourself)**: An advanced exponential penalty specifically designed to break exact repeating sequences.
+* **`dry_multiplier`** (`float`, default: `0.0`): The multiplier for the penalty. `0.0` disables DRY.
+* **`dry_base`** (`float`, default: `1.75`): The base value for the exponential penalty.
+* **`dry_allowed_length`** (`int`, default: `2`): Sequences extending beyond this length receive the penalty.
+* **`dry_penalty_last_n`** (`int`, default: `0`): Tokens to scan for repetitions. `0` = disabled, `-1` = context size.
+* **`dry_seq_breakers`** (`list[str]`, default: `["\n", ":", "\"", "*"]`): Tokens that reset the DRY sequence matching.
+
+
+### Constraints & Callbacks
+
+* **`logit_bias`** (`Dict[int, float]`, optional): Manually boost or penalize specific token IDs.
+* **`grammar`** (`LlamaGrammar`, optional): Force the model to generate text matching a specific BNF-like grammar (e.g., valid JSON).
+* **`logits_processor`** (`LogitsProcessorList`, optional): Custom Python callbacks to modify the logits tensor in-place before sampling.
+* **`stopping_criteria`** (`StoppingCriteriaList`, optional): Custom Python callbacks to halt generation based on the current sequence or scores.
+
+### 🛠️ Usage Example
+
+You can pass these parameters directly when calling the model to generate text.
+
+```python
+from llama_cpp import Llama
+
+# Load the model
+model = Llama(model_path="path/to/your/model.gguf")
+
+# Generate text with advanced sampling
+response = model.create_completion(
+    prompt="The secret to a happy life is",
+    max_tokens=100,
+    # Adjust core randomness
+    temperature=0.85,
+    top_p=0.90,
+    min_p=0.05,
+    # Prevent the model from repeating specific phrases
+    dry_multiplier=0.8,
+    dry_base=1.75,
+    dry_allowed_length=3,
+    # Standard repetition penalty
+    repeat_penalty=1.1,
+    penalty_last_n=256,
+)
+
+print(response["choices"][0]["text"])
+
+```
+
+---
+
+## Multi-modal Models
 
 `llama-cpp-python` supports such as llava1.5 which allow the language model to read information from both text and images.
 
@@ -1061,7 +1161,7 @@ For instance, if you want to work with larger contexts, you can expand the conte
 llm = Llama(model_path="./models/7B/llama-model.gguf", n_ctx=2048)
 ```
 
-## OpenAI Compatible Web Server
+## OpenAI Compatible Web Server (Deprecated)
 
 `llama-cpp-python` offers a web server which aims to act as a drop-in replacement for the OpenAI API.
 This allows you to use llama.cpp compatible models with any OpenAI compatible client (language libraries, services, etc).
@@ -1250,8 +1350,14 @@ For example:
 
 The reason libraries from other authors are smaller is that they often **only compile for a single architecture** (e.g., targeting only the RTX 30 series [SM86] or the RTX 40 series [SM89]). To maximize convenience, I provide an **integrated compilation** covering a wide range of hardware; you simply need to select the CUDA version that matches your environment to load and run it.
 
+### Quick tips for develop/user (continuously updated):
 
-Any contributions and changes to this package will be made with these goals in mind.
+* 1. I've determined that `llama_cpp.server` is currently in a semi-deprecated state (meaning it won't be maintained unless absolutely necessary, and I might even consider deleting or separating it to reduce the library size). I highly recommend using the `llama-server` program maintained by the upstream `llama.cpp` project, which offers a lower-level implementation, more frequent maintenance and optimization, and more reliable API calls.
+
+* 2. Regarding AMD and Intel graphics cards, AMD can certainly use ROCm as the primary backend (but the drawback is that it's basically only stable on Linux platforms), and Intel's Sycl will also encounter some compilation difficulties. I consistently recommend using the Vulkan backend for these two types of graphics cards for greater efficiency and stability, because the upstream `llama.cpp` Vulkan backend is actively maintained by many developers, generally allowing you to enjoy new feature optimizations and bug fixes earlier and faster.
+
+
+### Any suggestions, contributions, and modifications to this package will be directed toward building a user-friendly, efficient, and secure Python library.
 
 ## License
 

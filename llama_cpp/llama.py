@@ -479,15 +479,22 @@ class Llama:
         _is_recurrent = self._model.is_recurrent()
         _is_hybrid = self._model.is_hybrid()
         _n_swa = self._model.n_swa()
+        # Sync llama.cpp upstream (#20291): warn swa-full is not supported for non-SWA models.
+        if _n_swa == 0:
+            if (self.context_params.swa_full):
+                self.context_params.swa_full = False
+                if self.verbose:
+                    print("Llama.__init__: swa_full is not supported by this model, it will be disabled", file=sys.stderr)
+
         # checkpoints are created only if:
         # - the model uses SWA and we are not using `swa_full`
         # - the model architecture is marked as recurrent or hybrid
-        self.is_hybrid = _is_recurrent or _is_hybrid or (_n_swa > 0 and not swa_full)
+        self.is_hybrid = _is_recurrent or _is_hybrid or (_n_swa > 0 and not self.context_params.swa_full)
 
         if self.is_hybrid:
             if self.verbose:
                 print(f"Llama.__init__: Hybrid/Recurrent model detected."
-                      f"(is_recurrent: {_is_recurrent}, is_hybrid: {_is_hybrid}, n_swa: {_n_swa}, swa_full: {swa_full}). "
+                      f"(is_recurrent: {_is_recurrent}, is_hybrid: {_is_hybrid}, n_swa: {_n_swa}, swa_full: {self.context_params.swa_full}). "
                       f" Enabling HybridCheckpointCache(ctx_checkpoints={ctx_checkpoints}, checkpoint_interval={checkpoint_interval}).",
                       file=sys.stderr)
             self.ctx_checkpoints = ctx_checkpoints
@@ -1019,6 +1026,7 @@ class Llama:
         grammar: Optional[LlamaGrammar] = None, # optional BNF-like grammar to constrain sampling
         grammar_lazy: bool = False,
         idx: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         """Sample a token from the model.
         Returns:
@@ -1040,6 +1048,7 @@ class Llama:
                 temp=temp,
                 top_n_sigma=top_n_sigma,
                 min_keep=min_keep,
+                seed=seed if seed is not None else self._seed,
 
                 # Dynamic Temp
                 dynatemp_range=dynatemp_range,
@@ -1146,7 +1155,8 @@ class Llama:
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         grammar: Optional[LlamaGrammar] = None,
-        grammar_lazy :bool = False,
+        grammar_lazy: bool = False,
+        seed: Optional[int] = None,
     ) -> Generator[int, Optional[Sequence[int]], None]:
         """Create a generator of tokens from a prompt.
 
@@ -1157,12 +1167,41 @@ class Llama:
             ...     print(llama.detokenize([token]))
 
         Args:
-            tokens: The prompt tokens.
-            top_k: The top-k sampling parameter.
-            top_p: The top-p sampling parameter.
-            temp: The temperature parameter.
-            repeat_penalty: The repeat penalty parameter.
-            reset: Whether to reset the model state.
+            tokens: The prompt tokens to evaluate.
+            top_k: Limit the next token selection to the K most probable tokens. (<=0 to use vocab size)
+            top_p: Nucleus sampling. Limits selection to a cumulative probability of P.
+            min_p: Minimum P sampling. Drops tokens with a probability less than min_p relative to the most likely token.
+            typical_p: Locally typical sampling. (1.0 = disabled)
+            temp: Temperature. Controls randomness. (<=0.0 greedy, 0.0 no probabilities)
+            dynatemp_range: Range of dynamic temperature.
+            dynatemp_exponent: Exponent of dynamic temperature.
+            top_n_sigma: Limit selection to tokens within n * sigma of the max logit. (-1.0 = disabled)
+            min_keep: Minimum tokens to keep for sampling.
+            penalty_last_n: Last n tokens to penalize (0 = disable penalty, -1 = context size).
+            repeat_penalty: General penalty for repeated tokens. (1.0 = disabled)
+            frequency_penalty: Penalty based on the absolute frequency of a token in the prompt.
+            present_penalty: Flat penalty applied if a token is present anywhere in the context.
+            reset: If True, attempts to automatically match the KV cache prefix to avoid re-evaluation. If False, blindly appends tokens to existing context.
+            mirostat_mode: Mirostat sampling mode (0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0).
+            mirostat_tau: Target cross-entropy (surprisal) for Mirostat.
+            mirostat_eta: Learning rate for Mirostat.
+            xtc_threshold: Minimum probability threshold for XTC token removal.
+            xtc_probability: Chance for token removal in XTC sampling.
+            dry_multiplier: DRY (Don't Repeat Yourself) repetition penalty multiplier (0.0 = disabled).
+            dry_base: DRY repetition penalty base value.
+            dry_allowed_length: DRY maximum allowed sequence length without penalty.
+            dry_penalty_last_n: DRY tokens to scan for repetitions (0 = disabled, -1 = context size).
+            dry_seq_breakers: Array of sequence breakers for DRY sampling.
+            adaptive_target: Adaptive-p target probability (0.0 to 1.0, negative = disabled).
+            adaptive_decay: Adaptive-p decay rate (0.0 to 0.99).
+            use_infill: Activate specialized fill-in-the-middle sampler.
+            ignore_eos: If True, ignore the End-of-Sequence token.
+            logit_bias: Dictionary mapping token IDs to their bias values.
+            logits_processor: List of custom Python callbacks to modify logits in-place.
+            stopping_criteria: List of custom callbacks to halt generation dynamically.
+            grammar: Optional BNF-like grammar (GBNF) to constrain sampling syntax.
+            grammar_lazy: If True, activates grammar constraints only on specific trigger tokens.
+            seed: RNG seed for sampling. Overrides the instance seed.
 
         Yields:
             The generated tokens.
@@ -1170,59 +1209,93 @@ class Llama:
         original_tokens = list(tokens)
         # Check for kv cache prefix match
         if reset and self.n_tokens > 0:
-            longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
-            if longest_prefix > 0:
+            # 1. First, check for a 100% exact match of the entire sequence
+            full_match_prefix = self.longest_token_prefix(self._input_ids, tokens)
+
+            # --- FAST PATH: Zero-latency bypass for Hybrid Single-Turn & Multimodal ---
+            # If the cache is disabled (max_checkpoints <= 0) and we have a 100% match,
+            # we completely skip the N-1 truncation. This ensures that multimodal handlers
+            # (which just finished evaluating and already hold fresh logits) don't trigger
+            # unnecessary N-1 rollbacks or catastrophic KV cache clears.
+            if (
+                full_match_prefix == len(tokens)
+                and full_match_prefix == self.n_tokens
+                and self.is_hybrid
+                and (self._hybrid_cache_mgr is None or self._hybrid_cache_mgr.max_checkpoints <= 0)
+            ):
                 reset = False
+                longest_prefix = len(tokens)
+                tokens = tokens[longest_prefix:] # Empties the tokens array to bypass evaluation
+                if self.verbose:
+                    print(f"Llama.generate: Hybrid single-turn full match ({longest_prefix} tokens). Bypassing rollback/truncation.", file=sys.stderr)
 
-                if longest_prefix == len(tokens):
-                    if self.verbose:
-                        print(f"Llama.generate: Full match. Forcing prefix-- to evaluate 1 token.", file=sys.stderr)
-                    longest_prefix -= 1
-
-                # Physically erase trailing "ghost" tokens from the C++ KV cache
-                # to prevent attention misalignment in multi-round chats.
-                if longest_prefix < self.n_tokens:
-                    if self.is_hybrid and self._hybrid_cache_mgr is not None:
-                        if self.verbose:
-                            print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
-
-                        best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, 0)
-                        if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
-                            actual_prefix = best_ckpt.pos
-                        else:
-                            actual_prefix = 0
-                            self._hybrid_cache_mgr.clear()
-                            self._ctx.memory_clear(True)
-
-                        self.n_tokens = actual_prefix
-                        tokens = original_tokens[actual_prefix:]
-                        if self.verbose:
-                            print(
-                                f"Llama.generate: {actual_prefix} prefix-match hit, "
-                                f"remaining {len(tokens)} prompt tokens to eval",
-                                file=sys.stderr,
-                            )
-                    else:
-                        if self.verbose:
-                            print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
-                        self._ctx.memory_seq_rm(0, longest_prefix, -1)
-
-                        # Adjust the tokens array and cursor to reuse the matched cache
-                        self.n_tokens = longest_prefix
-                        tokens = tokens[longest_prefix:]
-
-                        if self.verbose:
-                            print(
-                                f"Llama.generate: {longest_prefix} prefix-match hit, "
-                                f"remaining {len(tokens)} prompt tokens to eval",
-                                file=sys.stderr,
-                            )
+            # --- STANDARD PATH: Force N-1 re-evaluation ---
             else:
-                # No prefix matched. Completely clear the KV cache to prevent context poisoning.
-                self.n_tokens = 0
-                self._ctx.memory_clear(True)
-                if self.is_hybrid and self._hybrid_cache_mgr is not None:
-                    self._hybrid_cache_mgr.clear()
+                # By matching against `tokens[:-1]`, we intentionally drop the last token.
+                # This forces the engine to re-evaluate the final token to refresh sampling logits.
+                longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
+
+                if longest_prefix > 0:
+                    reset = False
+
+                    # Note: Kept for legacy compatibility. Triggers if the prefix matching
+                    # somehow equals the full token length (e.g., edge cases in tokenization).
+                    if longest_prefix == len(tokens):
+                        if self.is_hybrid and (self._hybrid_cache_mgr is None or self._hybrid_cache_mgr.max_checkpoints <= 0):
+                            if self.verbose:
+                                print(f"Llama.generate: Full match on disabled hybrid cache. Skipping prefix-- to use existing fresh logits.", file=sys.stderr)
+                        else:
+                            if self.verbose:
+                                print(f"Llama.generate: Full match. Forcing prefix-- to evaluate 1 token.", file=sys.stderr)
+                            longest_prefix -= 1
+
+                    # Physically erase trailing "ghost" tokens from the C++ KV cache
+                    # to prevent attention misalignment in multi-round chats.
+                    if longest_prefix < self.n_tokens:
+                        if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                            if self.verbose:
+                                print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
+
+                            best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, 0)
+                            if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                                actual_prefix = best_ckpt.pos
+                            else:
+                                # Fallback: No checkpoint found, must fully clear the context to prevent poisoning
+                                actual_prefix = 0
+                                self._hybrid_cache_mgr.clear()
+                                self._ctx.memory_clear(True)
+
+                            self.n_tokens = actual_prefix
+                            tokens = original_tokens[actual_prefix:]
+                            if self.verbose:
+                                print(
+                                    f"Llama.generate: {actual_prefix} prefix-match hit, "
+                                    f"remaining {len(tokens)} prompt tokens to eval",
+                                    file=sys.stderr,
+                                )
+                        else:
+                            if self.verbose:
+                                print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
+                            self._ctx.memory_seq_rm(0, longest_prefix, -1)
+
+                            # Adjust the tokens array and cursor to reuse the matched cache
+                            self.n_tokens = longest_prefix
+                            tokens = tokens[longest_prefix:]
+
+                            if self.verbose:
+                                print(
+                                    f"Llama.generate: {longest_prefix} prefix-match hit, "
+                                    f"remaining {len(tokens)} prompt tokens to eval",
+                                    file=sys.stderr,
+                                )
+        if reset:
+            # No prefix matched at all. Completely clear the KV cache to prevent context poisoning.
+            self.n_tokens = 0
+            self._ctx.memory_clear(True)
+            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                self._hybrid_cache_mgr.clear()
+            if self.verbose:
+                print("Llama.generate: Context reset requested or no prefix match. Cleared KV cache.", file=sys.stderr)
 
         # Reset mirostat sampling
         params = LlamaSamplingParams(
@@ -1270,8 +1343,10 @@ class Llama:
             logit_bias=self._convert_logit_bias(logit_bias),
             grammar=grammar._grammar if grammar else "",
             grammar_lazy=grammar_lazy,
+            seed=seed if seed is not None else self._seed,
         )
 
+        # Register custom python-level logits processors if provided
         if logits_processor:
             def adapter(token_data_array: llama_cpp.llama_token_data_array):
                 if self._logits_all:
@@ -1293,6 +1368,7 @@ class Llama:
             if CommonSamplerType.CUSTOM not in params.samplers:
                 params.samplers.insert(3, CommonSamplerType.CUSTOM)
 
+        # Free previous sampling context to prevent memory leaks
         if getattr(self, "_sampling_ctx", None) is not None:
             self._sampling_ctx.close()
             self._sampling_ctx = None
@@ -1302,13 +1378,19 @@ class Llama:
         sample_idx = self.n_tokens + len(tokens) - 1
         tokens = list(tokens)
 
-        # Eval and sample
+        # Main evaluation and generation loop
         try:
             while True:
                 if len(tokens) > 0:
                     # For hybrid models processing a prompt (len > 1), force an N-1 checkpoint
                     # to safely allow 1-token rollbacks (e.g., for seed changes on 100% prompt matches).
-                    if self.is_hybrid and self._hybrid_cache_mgr is not None and len(tokens) > 1:
+                    # ONLY apply this if rollback capabilities are enabled (max_checkpoints > 0).
+                    if (
+                        self.is_hybrid
+                        and self._hybrid_cache_mgr is not None
+                        and self._hybrid_cache_mgr.max_checkpoints > 0
+                        and len(tokens) > 1
+                    ):
                         body_tokens = tokens[:-1]
                         last_token = [tokens[-1]]
 
@@ -1327,12 +1409,15 @@ class Llama:
                     else:
                         # Standard evaluation or single-token generation step
                         self.eval(tokens)
+
+                # Sample loop
                 while sample_idx < self.n_tokens:
                     token = self._sampling_ctx.sample(self._ctx, idx=-1)
                     self._sampling_ctx.accept(token, False if grammar is None else True)
 
                     sample_idx += 1
 
+                    # Halt generation if custom stopping criteria are met
                     if stopping_criteria is not None:
                         if self._logits_all:
                             logits_idx = sample_idx - self.n_tokens
@@ -1350,13 +1435,17 @@ class Llama:
                         ):
                             return
 
+                    # Yield the generated token to the caller
                     tokens_or_none = yield token
+
                     tokens.clear()
                     tokens.append(token)
 
                     if tokens_or_none is not None:
                         tokens.extend(tokens_or_none)
 
+                    # Rollback Check: A previously evaluated token (e.g. from speculative decoding)
+                    # mismatched the newly sampled token. We must rollback the KV cache.
                     if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
                         self.n_tokens = sample_idx
                         if self.is_hybrid:
@@ -1371,10 +1460,13 @@ class Llama:
                                     self._ctx.memory_clear(True)
                                     self.n_tokens = 0
                         else:
+                            if self.verbose:
+                                print(f"Llama.generate: Draft token rejected. Truncating context to {self.n_tokens}.", file=sys.stderr)
                             self._ctx.memory_seq_rm(0, self.n_tokens, -1)
 
                         break
 
+                # Speculative Decoding (Draft Model) logic
                 if self.draft_model is not None:
                     if self.is_hybrid:
                         if self.verbose:
@@ -1390,7 +1482,12 @@ class Llama:
                             ]
                         )
         finally:
-            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+            # Ensure the final state is checkpointed for hybrid models when generation finishes or is interrupted
+            if (
+                self.is_hybrid
+                and self._hybrid_cache_mgr is not None
+                and self._hybrid_cache_mgr.max_checkpoints > 0
+            ):
                 current_history = self._input_ids[:self.n_tokens].tolist()
 
                 self._hybrid_cache_mgr.save_checkpoint(
@@ -1593,7 +1690,6 @@ class Llama:
         dynatemp_exponent: float = 1.0,
         min_keep: int = 0,
         stream: bool = False,
-        seed: Optional[int] = None,
         mirostat_mode: int = 0,
         mirostat_tau: float = 5.0,
         mirostat_eta: float = 0.1,
@@ -1612,7 +1708,8 @@ class Llama:
         logit_bias: Optional[Dict[int, float]] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
-        grammar_lazy: bool = False
+        grammar_lazy: bool = False,
+        seed: Optional[int] = None,
     ) -> Union[
         Iterator[CreateCompletionResponse], Iterator[CreateCompletionStreamResponse]
     ]:
@@ -1756,11 +1853,6 @@ class Llama:
                 if self.verbose:
                     print("Llama._create_completion: cache miss", file=sys.stderr)
 
-        if seed is not None:
-            self.set_seed(seed)
-        else:
-            self.set_seed(random.Random(self._seed).randint(0, 2 ** 32))
-
         finish_reason = "length"
         multibyte_fix = 0
         for token in self.generate(
@@ -1796,6 +1888,7 @@ class Llama:
             logits_processor=logits_processor,
             grammar=grammar,
             grammar_lazy=grammar_lazy,
+            seed=seed if seed is not None else self._seed,
         ):
             if llama_cpp.llama_token_is_eog(self._model.vocab, token):
                 text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)

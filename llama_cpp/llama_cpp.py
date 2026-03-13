@@ -348,6 +348,7 @@ LLAMA_TOKEN_ATTR_SINGLE_WORD = 1 << 9
 #     LLAMA_FTYPE_MOSTLY_TQ1_0         = 36, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
+#     LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
 #
 #     LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
 # };
@@ -387,6 +388,7 @@ LLAMA_FTYPE_MOSTLY_BF16 = 32
 LLAMA_FTYPE_MOSTLY_TQ1_0 = 36
 LLAMA_FTYPE_MOSTLY_TQ2_0 = 37
 LLAMA_FTYPE_MOSTLY_MXFP4_MOE = 38
+LLAMA_FTYPE_MOSTLY_NVFP4 = 39
 LLAMA_FTYPE_GUESSED = 1024
 
 # enum llama_rope_scaling_type {
@@ -1232,6 +1234,47 @@ def llama_numa_init(numa: int, /):
 # TODO: Add llama_detach_threadpool
 
 
+# typedef void (*llama_model_set_tensor_data_t)(struct ggml_tensor * tensor, void * userdata);
+llama_model_set_tensor_data_t = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.c_void_p
+)
+
+
+# // Create a new model from GGUF metadata as well as a function to set the tensor data
+# //   - tensors are created as GGML_TYPE_F32 by default,
+# //     override by adding a tensor with the same name but a different name to the context
+# LLAMA_API struct llama_model * llama_model_init_from_user(
+#                 struct gguf_context * metadata,
+#         llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with
+#                                 void * set_tensor_data_ud, // userdata for function
+#             struct llama_model_params   params);
+@ctypes_function(
+    "llama_model_init_from_user",
+    [
+        ctypes.c_void_p,
+        llama_model_set_tensor_data_t,
+        ctypes.c_void_p,
+        llama_model_params
+    ],
+    llama_model_p_ctypes,
+)
+def llama_model_init_from_user(
+    metadata: ctypes.c_void_p,
+    set_tensor_data: llama_model_set_tensor_data_t,
+    set_tensor_data_ud: ctypes.c_void_p,
+    params: llama_model_params,
+    /
+) -> Optional[llama_model_p]:
+    """
+    Create a new model from GGUF metadata as well as a function to set the tensor data
+      - tensors are created as GGML_TYPE_F32 by default,
+        override by adding a tensor with the same name but a different name to the context
+    """
+    ...
+
+
 # DEPRECATED(LLAMA_API struct llama_model * llama_load_model_from_file(
 #                          const char * path_model,
 #           struct llama_model_params   params),
@@ -1247,7 +1290,7 @@ def llama_load_model_from_file(
     ...
 
 
-# // Load the model from a file
+# // Load a model from a file
 # // If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
 # // If the split file name does not follow this pattern, use llama_model_load_from_splits
 # LLAMA_API struct llama_model * llama_model_load_from_file(
@@ -1261,15 +1304,15 @@ def llama_load_model_from_file(
 def llama_model_load_from_file(
     path_model: bytes, params: llama_model_params, /
 ) -> Optional[llama_model_p]:
-    """Load the model from a file
-
+    """
+    Load a model from a file
     If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
-
-    If the split file name does not follow this pattern, use llama_model_load_from_splits"""
+    If the split file name does not follow this pattern, use llama_model_load_from_splits
+    """
     ...
 
 
-# // Load the model from multiple splits (support custom naming scheme)
+# // Load a model from multiple splits (support custom naming scheme)
 # // The paths must be in the correct order
 # LLAMA_API struct llama_model * llama_model_load_from_splits(
 #                          const char ** paths,
@@ -1283,9 +1326,10 @@ def llama_model_load_from_file(
 def llama_model_load_from_splits(
     paths: list[bytes], n_paths: int, params: llama_model_params, /
 ) -> Optional[llama_model_p]:
-    """Load the model from multiple splits (support custom naming scheme)
-
-    The paths must be in the correct order"""
+    """
+    Load a model from multiple splits (support custom naming scheme)
+    The paths must be in the correct order
+    """
     ...
 
 
@@ -2982,7 +3026,7 @@ def llama_get_logits(ctx: llama_context_p, /) -> CtypesArray[ctypes.c_float]:
 
 # // Logits for the ith token. For positive indices, Equivalent to:
 # // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
-# // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
+# // Negative indices can be used to access logits in reverse order, -1 is the last logit.
 # // returns NULL for invalid ids.
 # LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 @ctypes_function(
@@ -3017,7 +3061,7 @@ def llama_get_embeddings(ctx: llama_context_p, /) -> CtypesArray[ctypes.c_float]
 
 # // Get the embeddings for the ith token. For positive indices, Equivalent to:
 # // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
-# // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
+# // Negative indices can be used to access embeddings in reverse order, -1 is the last embedding.
 # // shape: [n_embd] (1-dimensional)
 # // returns NULL for invalid ids.
 # LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -3076,9 +3120,9 @@ def llama_get_sampled_token_ith(
     ...
 
 
-# // Get the backend sampled probabilites for the ith token
+# // Get the backend sampled probabilities for the ith token
 # // The index matches llama_get_sampled_token_ith().
-# // Returns NULL if no probabilites were generated.
+# // Returns NULL if no probabilities were generated.
 # LLAMA_API float *  llama_get_sampled_probs_ith      (struct llama_context * ctx, int32_t i);
 @ctypes_function(
     "llama_get_sampled_probs_ith",
@@ -3089,9 +3133,9 @@ def llama_get_sampled_probs_ith(
     ctx: llama_context_p, i: ctypes.c_int32, /
 ) -> CtypesArray[ctypes.c_float]:
     """
-    Get the backend sampled probabilites for the ith token
+    Get the backend sampled probabilities for the ith token
     The index matches llama_get_sampled_token_ith().
-    Returns NULL if no probabilites were generated.
+    Returns NULL if no probabilities were generated.
     """
     ...
 
@@ -4345,7 +4389,7 @@ def llama_sampler_init_mirostat_v2(
     ...
 
 
-# /// @details Intializes a GBNF grammar, see grammars/README.md for details.
+# /// @details Initializes a GBNF grammar, see grammars/README.md for details.
 # /// @param vocab The vocabulary that this grammar will be used with.
 # /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
 # /// @param grammar_root The name of the start symbol for the grammar.

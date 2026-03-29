@@ -131,8 +131,10 @@ if (LLAMA_BUILD)
         ggml-metal
         ggml-musa
         ggml-opencl
+        ggml-openvino
         ggml-rpc
         ggml-sycl
+        ggml-virtgpu
         ggml-vulkan
         ggml-webgpu
         ggml-zdnn

@@ -9,6 +9,7 @@ import os
 import random
 import string
 import sys
+import zlib
 
 from contextlib import ExitStack
 from typing import (
@@ -128,6 +129,7 @@ class LlamaChatCompletionHandler(Protocol):
         grammar: Optional[llama_grammar.LlamaGrammar] = None,
         logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
+        assistant_prefill: bool = False,
         **kwargs,  # type: ignore
     ) -> Union[
         llama_types.CreateChatCompletionResponse,
@@ -626,11 +628,30 @@ def chat_formatter_to_chat_completion_handler(
         logit_bias: Optional[Dict[str, float]] = None,
         logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
+        assistant_prefill: bool = False,
         **kwargs,  # type: ignore
     ) -> Union[
         llama_types.CreateChatCompletionResponse,
         Iterator[llama_types.CreateChatCompletionStreamResponse],
     ]:
+
+        # JIT Interception for Assistant Prefill (Continue Generation)
+        partial_assistant_text = ""
+        if assistant_prefill:
+            if not messages:
+                if llama.verbose:
+                    print("Llama.create_chat_completion: Warning! 'assistant_prefill=True' but messages list is empty. Ignoring prefill.", file=sys.stderr)
+            elif messages[-1].get("role") != "assistant":
+                if llama.verbose:
+                    print(f"Llama.create_chat_completion: Warning! 'assistant_prefill=True' but last message role is '{messages[-1].get('role')}'. Expected 'assistant'. Ignoring prefill.", file=sys.stderr)
+            else:
+                # Safe to prefill: pop the last message without mutating the user's original list
+                messages = messages.copy()
+                partial_message = messages.pop()
+                partial_assistant_text = partial_message.get("content", "") or ""
+                if not partial_assistant_text and llama.verbose:
+                    print("Llama.create_chat_completion: Warning! 'assistant_prefill=True' but the assistant message has no content.", file=sys.stderr)
+
         result = chat_formatter(
             messages=messages,
             functions=functions,
@@ -638,6 +659,11 @@ def chat_formatter_to_chat_completion_handler(
             tools=tools,
             tool_choice=tool_choice,
         )
+
+        # Seamlessly append the partial assistant text to the standard generated Jinja template
+        if partial_assistant_text:
+            result.prompt += partial_assistant_text
+
         prompt = llama.tokenize(
             result.prompt.encode("utf-8"),
             add_bos=not result.added_special,
@@ -3161,6 +3187,10 @@ while also answering every question accurately, clearly, and step-by-step when a
             current_idx = 0
             n_chunks = self._mtmd_cpp.mtmd_input_chunks_size(chunks)
 
+            # Cursor to track the actual media contents (URLs or base64 data) provided by the user
+            media_items_count = len(media_items)
+            media_items_cur = 0
+
             for i in range(n_chunks):
                 chunk = self._mtmd_cpp.mtmd_input_chunks_get(chunks, i)
                 if chunk is None: continue
@@ -3180,17 +3210,32 @@ while also answering every question accurately, clearly, and step-by-step when a
                         self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_AUDIO
                     ]:
                     # Extract media properties
+                    # Note(JamePeng):
+                    # The M-RoPE model is based on `n_pos` instead of `n_tokens` (of course, there's no difference in non-M-RoPE models).
+                    # However, I still keep `n_tokens` because if `n_pos` is used, the underlying system will assume it is a full-match and will skip eval and sample.
+                    # chunk_n_pos = self._mtmd_cpp.mtmd_input_chunk_get_n_pos(chunk) # equals to max(t,h,w) for M-RoPE; equals to `n_tokens` otherwise
                     chunk_n_tokens = self._mtmd_cpp.mtmd_input_chunk_get_n_tokens(chunk)
-                    chunk_id_bytes = self._mtmd_cpp.mtmd_input_chunk_get_id(chunk)
 
-                    if chunk_id_bytes:
+                    if media_items_cur < media_items_count:
+                        # The C++ parser only sees identical placeholders (e.g., "<__media__>").
+                        # We MUST inject the actual media content's identity here.
+                        real_media_url = media_items[media_items_cur]["url"]
                         # Vocabulary Positive forward: 0 to 248,319 (Qwen3.5)
-                        # Create Negative Reverse Vocabulary ID: -100 to -16,777,316
-                        # Improved longest_token_prefix search matching performance
-                        media_id = - (abs(hash(chunk_id_bytes.decode('utf-8', errors='ignore'))) % (2**24)) - 100
+                        # Generate a deterministic, unique negative ID for this specific image/audio.
+                        # - zlib.crc32 ensures cross-platform and cross-run consistency (unlike Python's hash()).
+                        # - We map it to a negative space (-100 to -16,777,316) to avoid colliding with
+                        #   positive text token IDs (e.g., Qwen3.5 vocab goes up to ~152k).
+                        # This empowers `longest_token_prefix` to correctly identify and reuse cached images,
+                        # while instantly breaking the match if the image content changes.
+                        # media_id = - (zlib.crc32(real_media_url.encode('utf-8')) % (2**24)) - 100
+                        media_id = - (zlib.crc32(real_media_url.encode('utf-8')) & 0xFFFFFF) - 100
+                        media_items_cur += 1
                     else:
                         # Magic Negative Number as fallback :)
                         media_id = -314159
+
+                    if self.verbose:
+                        print(f"{self.log_prefix}(mtmd_input_chunk_media_id): chunk_n_tokens: {chunk_n_tokens}, media_id: {media_id}, ")
 
                     chunk_token_spans.append((current_idx, current_idx + chunk_n_tokens, chunk, chunk_type, media_id))
 
@@ -3287,7 +3332,7 @@ while also answering every question accurately, clearly, and step-by-step when a
             # 3. KV Cache Synchronization & State Rollback
             # Compares the virtual ledger with physical history to prevent Cache Poisoning.
             current_history = llama.input_ids[:llama.n_tokens].tolist()
-            longest_prefix = llama.longest_token_prefix(current_history, full_prompt_ids)
+            longest_prefix = llama.longest_token_prefix(current_history, full_prompt_ids, self.verbose)
 
             if longest_prefix < llama.n_tokens:
                 if llama.is_hybrid and llama._hybrid_cache_mgr is not None:
@@ -3302,10 +3347,14 @@ while also answering every question accurately, clearly, and step-by-step when a
                             if self.verbose:
                                 print(f"{self.log_prefix}(__call__): Successfully rolled back to checkpoint at pos {llama.n_tokens}.", file=sys.stderr)
                         else:
+                            if self.verbose:
+                                print(f"{self.log_prefix}(__call__): No suitable checkpoint found or restore failed. Clearing hybrid cache entirely.", file=sys.stderr)
                             llama._hybrid_cache_mgr.clear()
                             llama._ctx.memory_clear(True)
                             llama.n_tokens = 0
                     else:
+                        if self.verbose:
+                            print(f"{self.log_prefix}(__call__): Hybrid cache enabled but max_checkpoints is 0. Clearing cache entirely.", file=sys.stderr)
                         llama._hybrid_cache_mgr.clear()
                         llama._ctx.memory_clear(True)
                         llama.n_tokens = 0
@@ -3709,8 +3758,8 @@ while also answering every question accurately, clearly, and step-by-step when a
             from huggingface_hub.utils import validate_repo_id  # type: ignore
         except ImportError:
             raise ImportError(
-                "Llama.from_pretrained requires the huggingface-hub package. "
-                "You can install it with `pip install huggingface-hub`."
+                "Llama.from_pretrained requires the huggingface_hub package. "
+                "You can install it with `pip install --upgrade huggingface_hub`."
             )
 
         validate_repo_id(repo_id)

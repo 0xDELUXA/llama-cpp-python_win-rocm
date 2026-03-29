@@ -59,12 +59,13 @@ class LlamaDiskCache(BaseLlamaCache):
     """
 
     def __init__(
-        self, cache_dir: str = ".cache/llama_cache", capacity_bytes: int = (2 << 30)
+        self, cache_dir: str = ".cache/llama_cache", capacity_bytes: int = (2 << 30), verbose: bool = False
     ):
         super().__init__(capacity_bytes)
         self.cache_dir = cache_dir
         # Native SQLite size limit and LRU eviction
         self.cache = diskcache.Cache(cache_dir, size_limit=capacity_bytes)
+        self.verbose = verbose
 
     @property
     def cache_size(self):
@@ -83,7 +84,7 @@ class LlamaDiskCache(BaseLlamaCache):
         min_key: Optional[Tuple[int, ...]] = None
         target_len = len(key)
         for k in self.cache.iterkeys():  # type: ignore
-            prefix_len = llama_core.Llama.longest_token_prefix(k, key)
+            prefix_len = llama_core.Llama.longest_token_prefix(k, key, self.verbose)
             if prefix_len > min_len:
                 min_len = prefix_len
                 min_key = k  # type: ignore
@@ -123,13 +124,14 @@ class LlamaRAMCache(BaseLlamaCache):
     Maintains an LRU eviction policy with O(1) size tracking.
     """
 
-    def __init__(self, capacity_bytes: int = (2 << 30)):
+    def __init__(self, capacity_bytes: int = (2 << 30), verbose: bool = False):
         super().__init__(capacity_bytes)
         self.capacity_bytes = capacity_bytes
         self.cache_state: OrderedDict[
             Tuple[int, ...], "llama_core.LlamaState"
         ] = OrderedDict()
         self._current_size = 0
+        self.verbose = verbose
 
     @property
     def cache_size(self):
@@ -142,7 +144,7 @@ class LlamaRAMCache(BaseLlamaCache):
         min_len = 0
         min_key = None
         keys = (
-            (k, llama_core.Llama.longest_token_prefix(k, key))
+            (k, llama_core.Llama.longest_token_prefix(k, key, self.verbose))
             for k in self.cache_state.keys()
         )
         for k, prefix_len in keys:

@@ -437,20 +437,23 @@ By default `llama-cpp-python` generates completions in an OpenAI compatible form
 
 Text completion is available through the [`__call__`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama.__call__) and [`create_completion`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama.create_completion) methods of the [`Llama`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama) class.
 
-### Pulling models from Hugging Face Hub
+### Pulling models from [Hugging Face Hub](https://huggingface.co/models)
 
 You can download `Llama` models in `gguf` format directly from Hugging Face using the [`from_pretrained`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama.from_pretrained) method.
-You'll need to install the `huggingface-hub` package to use this feature (`pip install huggingface-hub`).
+
+You'll need to install the `huggingface_hub` package to use this feature (`pip install --upgrade huggingface_hub`).
+
+
 
 ```python
 llm = Llama.from_pretrained(
-    repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
-    filename="*q8_0.gguf",
+    repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    filename="qwen2.5-0.5b-instruct-q4_k_m.gguf",
     verbose=False
 )
 ```
 
-By default [`from_pretrained`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama.from_pretrained) will download the model to the huggingface cache directory, you can then manage installed model files with the [`huggingface-cli`](https://huggingface.co/docs/huggingface_hub/en/guides/cli) tool.
+By default [`from_pretrained`](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/#llama_cpp.Llama.from_pretrained) will download the model to the huggingface cache directory, you can then manage installed model files with the [`hf`](https://huggingface.co/docs/huggingface_hub/en/guides/cli) tool.
 
 ### Chat Completion
 
@@ -611,6 +614,101 @@ llm = Llama.from_pretrained(
 
 **NOTE**: There is no need to provide the default system messages used in Functionary as they are added automatically in the Functionary chat handler. Thus, the messages should contain just the chat messages and/or system messages that provide additional context for the model (e.g.: datetime, etc.).
 </details>
+
+---
+
+## Continuing Assistant Responses (Prefill)
+
+`llama-cpp-python` supports native **Assistant Prefill** for seamless message continuation. You can now simply use the `assistant_prefill=True` parameter in the `create_chat_completion` function.
+
+This safely renders the `N-1` conversation history using standard Jinja templates (preserving exact control tokens) and flawlessly appends your partial text directly to the prompt.
+
+```python
+from llama_cpp import Llama
+
+llm = Llama(model_path="path/to/model.gguf")
+
+# An interrupted/partial conversation
+messages = [
+    {"role": "user", "content": "What are the first 5 planets in the solar system?"},
+    {"role": "assistant", "content": "The first 5 planets in our solar system are:\n1. Mercury\n2."}
+]
+
+# Seamlessly continue the generation
+response = llm.create_chat_completion(
+    messages=messages,
+    max_tokens=50,
+    assistant_prefill=True # <--- Enables seamless continuation
+)
+
+prefilled_text = messages[-1]["content"]
+# The model will flawlessly continue from " Venus\n3. Earth..."
+generated_text = response["choices"][0]["message"]["content"]
+
+print(prefilled_text + generated_text)
+```
+
+---
+
+## Dynamic LoRA Routing & Control Vectors (Multi-Tenant Serving)
+
+Historically, `llama-cpp-python` only supported "static loading" where a LoRA was permanently baked into the context during initialization. Switching personas required reloading the entire model or duplicating it in VRAM.
+
+`llama-cpp-python` now supports **Just-In-Time (JIT)** dynamic adapter routing. Instead of statically binding a single LoRA to a model during initialization (which locks the instance to a single task), you can now preload multiple adapters into VRAM and seamlessly apply them on-the-fly per request.
+
+This architecture unlocks true **Multi-Tenant Serving**:
+* **Zero-Latency Switching:** Compute graph weights are atomically modified in C++ memory instantly before evaluation.
+* **VRAM Efficiency:** You only load the heavy base model once. Multiple LoRAs share the same base model memory.
+* **Thread-Safe & Contamination-Free:** Strict internal state debouncing ensures that weights are perfectly cleaned between requests, guaranteeing zero persona contamination.
+
+### Dynamic LoRA Example
+
+```python
+from llama_cpp import Llama
+
+# 1. Load the pure base model once
+llm = Llama(model_path="path/to/llama-3-8b.gguf")
+
+# 2. Preload multiple LoRAs into VRAM
+llm.load_lora("python_coder", "path/to/python-coder-lora.gguf")
+llm.load_lora("translator", "path/to/spanish-translator-lora.gguf")
+
+# 3. User A: Coding Task (Instantly applies the coder LoRA)
+response_a = llm.create_chat_completion(
+    messages=[{"role": "user", "content": "Write a fast inverse square root in C."}],
+    active_loras=[{"name": "python_coder", "scale": 1.0}]
+)
+
+# 4. User B: Translation Task (Zero-latency switch to the translator LoRA)
+response_b = llm.create_chat_completion(
+    messages=[{"role": "user", "content": "Explain quantum physics in Spanish."}],
+    active_loras=[{"name": "translator", "scale": 0.85}] # Apply at 85% strength
+)
+
+# 5. User C: General Query (Automatically wipes graph weights for a clean base model state)
+response_c = llm.create_chat_completion(
+    messages=[{"role": "user", "content": "What is the capital of France?"}]
+)
+
+# 6. Cleanup (Optional: manually free VRAM for specific LoRAs)
+llm.unload_lora("python_coder")
+```
+
+### Control Vector Injection (Representation Engineering)
+
+In addition to LoRA, the API supports dynamic injection of **Control Vectors (CVec)**. This allows you to steer the model's behavior, emotion, or alignment by directly modifying the activation values at specific hidden layers, without needing `.gguf` weight files.
+
+```python
+response = llm.create_chat_completion(
+    messages=[{"role": "user", "content": "Tell me a story about a futuristic city."}],
+    control_vector={
+        "data": [...],         # A flattened 1D list of floats representing the vector
+        "layer_start": 15,     # Apply starting from this layer (inclusive)
+        "layer_end": 32        # Apply up to this layer (inclusive)
+    }
+)
+```
+*Note(JamePeng): Ensure your `data` array length exactly matches `embedding_length * layer_end`. The C++ backend maps the buffer continuously starting from layer 1, so early skipped layers must be zero-padded in your array.*
 
 ---
 

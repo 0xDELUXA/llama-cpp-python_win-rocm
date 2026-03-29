@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.33] Fixing Multimodal Image Freezes, Stabilizing Logits, and Optimized Legacy Cache Logic
+
+- perf(mtmd): optimize media_id masking with bitwise AND
+    - Replaced the modulo operation (`% (2**24)`) with a bitwise AND mask (`& 0xFFFFFF`) when calculating the deterministic `media_id` from the CRC32 hash. This is a micro-optimization that leverages faster native CPU bitwise instructions instead of division, resulting in more idiomatic and performant low-level bit masking.
+    - When processing 1-2 images, the difference between % and & is only a few nanoseconds, imperceptible to the user. In future video processing, you might need to frantically calculate IDs within a for loop for 100 or even 300 frames of data. In this case, the extremely low CPU overhead of the bitwise operation & 0xFFFFFF ensures that the main thread will not experience any computational blockage at the Python layer when building a virtual ledger of tens of thousands of characters.
+
+- fix(mtmd): prevent multimodal image freeze by injecting deterministic media IDs
+    - Fixed a critical "image freeze" bug (report by **@KLL535**) where the model would continuously reuse the first cached image regardless of new inputs.
+    - The issue occurred because the C++ `self._mtmd_cpp.mtmd_input_chunk_get_id(chunk)` parser returns an empty ID (`b''`) for placeholder tokens like `<__media__>`, causing all media to fallback to the same magic number (`-314159`). This resulted in false-positive KV cache prefix matches.
+    - Replaced the C++ chunk ID extraction with a Python-side `media_item_cursor` that generates a deterministic 32-bit negative ID using `zlib.crc32(real_media_url)`.
+    - This ensures `longest_token_prefix` correctly identifies and reuses identical images while instantly breaking the cache match when the image content changes.
+    * Chat Structure: **[System Prompt] + [Image] + [Question]**
+    - The computational cost should be significantly reduced for the same image but different questions.
+
+- fix(Llama.generate): add explicit fallback context reset and expand Llama.generate docstrings
+    - Added a fallback `if reset:` block in `Llama.generate` to ensure the KV cache and hybrid cache manager are explicitly cleared when `reset=True` is passed and no prefix match is found. This prevents potential context poisoning from previous runs.
+    - Added comprehensive docstrings to the `generate` method for all newly integrated sampler parameters (e.g., XTC, Mirostat, DRY penalties etc.).
+    - Added explicit verbose logging for cache resetting, rollback events, and speculative decoding behaviors to improve debuggability.
+
+- docs(README.md): add sampling parameter guide and strategic project tips to README
+    - Sampling Documentation: Added a comprehensive guide for `LlamaSamplingParams`. It covers core, advanced (XTC, Dynatemp, Adaptive-P), entropy (Mirostat), and DRY repetition penalty configurations with a clean Python usage example.
+    - Project Tips: Added a new "Quick tips" section to explicitly communicate the semi-deprecated status of `llama_cpp.server` in favor of the upstream `llama-server`.
+    - Backend Recommendations: Added practical advice for AMD and Intel GPU users, officially recommending the Vulkan backend for cross-platform stability and faster updates.
+
+- fix(sampling): prevent memory drift and hallucinations in logits view
+    - Previously, the numpy view for `logits_ptr` in `LlamaSamplingContext.sample` was only initialized once. If the underlying C++ buffer was reallocated or shifted (e.g., due to dynamic batch sizes or KV cache shifts), the numpy array would point to stale memory, leading to severe model hallucinations or segfaults.
+    - Added explicit `_logits_ptr_addr` tracking to monitor the physical C memory address.
+    - The zero-copy numpy view (`_logits_view`) is now safely recreated on-the-fly whenever the backend memory address changes.
+    - Added proper initialization and garbage collection for the new tracker in `__init__` and `close`.
+
+- feat(_ggml): extend ctypes bindings with more ggml constants, enums, and structs
+
+- fix(chat_handler): fix tools and function calling in MTMDChatHandler.(Issue reported by **@alcoftTAO**)
+
+- perf(cache): optimize LlamaDiskCache I/O and fix LRU behavior
+    - Delegated LRU and size limits to native `diskcache` SQLite engine, removing the slow manual eviction loop.
+    - Added an O(1) early exit in `_find_longest_prefix_key` to prevent unnecessary full-table disk scans.
+    - Fixed a destructive read bug by replacing `.pop()` with standard access to properly update LRU timestamps.
+    - Added fast-path empty checks to bypass disk queries entirely when the cache is empty.
+
+- perf(cache): upgrade LlamaRAMCache to O(1) eviction and set LlamaTrieCache as default
+Addressed severe performance bottlenecks in legacy RAM caching components:
+    - Refactored `LlamaRAMCache` to use an O(1) `_current_size` tracker instead of an O(N) dynamic sum. This eliminates massive CPU spikes and O(N^2) complexity during LRU eviction cycles.
+    - Added strict OOM safeguards to `LlamaRAMCache`: The current size is explicitly clamped to 0 during evictions, and hard-reset to 0 if the cache empties, preventing catastrophic capacity drift.
+    - Introduced early-exit O(1) short-circuits in `__getitem__` and `__contains__` to bypass expensive prefix searches when the cache is empty.
+    - Updated the `LlamaCache` backward-compatibility alias to point to the highly optimized `LlamaTrieCache` instead of the legacy `LlamaRAMCache`.
+
+- fix(core): disable swa_full for non-SWA models (sync llama.cpp upstream #20291)
+    - Fallback `context_params.swa_full` to False if `_n_swa == 0` and emit a warning.
+    - Updated `is_hybrid` validation to use the resolved `self.context_params.swa_full` state.
+
+- fix(chat_format): fix namespace and variable shadowing of llama modules
+    - Changed imports to use `llama_cpp_lib` and `llama_core` to avoid namespace collisions.
+    - Fixed severe variable shadowing where the `llama` module was being overshadowed by the `llama` parameter in function signatures.
+    - Updated associated type hints and C-API bindings to use the new isolated aliases.
+    - Corrected `LlamaGrammar` type definitions to point to the `llama_grammar` module.
+
+- fix(cache): fix namespace shadowing to prevent AttributeError (Issue reported by **@kantan-kanto**)
+    - Renamed `llama_cpp.llama` import to `llama_core` and `llama_cpp.llama_cpp` to `llama_cpp_lib` to prevent namespace collision.
+    - Fixed `AttributeError` thrown when accessing `llama_cpp.llama.Llama.longest_token_prefix`.
+    - Updated all associated type hints and C-API bindings in cache classes to use the new isolated aliases.
+
+- feat(MTMDChatHandler): support audio inputs and fix interleaved media ordering
+    - Refactored `CHAT_FORMAT` to use a single loop for `message.content`, preserving the exact chronological order of interleaved text, images, and audio.
+    - Added template routing for `audio_url`.
+    - Added template routing for OpenAI's `input_audio` format, properly formatting it as a Data URI.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/d23355afc319f598d0e588a2d16a4da82e14ff41](https://github.com/ggml-org/llama.cpp/commit/d23355afc319f598d0e588a2d16a4da82e14ff41)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260313
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/e7e1d48065ba53846f290cfe563c8c839a062ebe...b0f00a96d3803863dd7d479f0cb1305f76f741b3
+
 ## [0.3.32] Hybrid/Multimodal Model Single-Turn Optimizations & Fix Sampling Seed
 
 - perf(hybrid): optimize multimodal single-turn and fix KV clear bug

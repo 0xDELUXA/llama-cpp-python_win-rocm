@@ -252,12 +252,16 @@ def mtmd_support_vision(ctx: mtmd_context_p) -> c_bool:
 def mtmd_support_audio(ctx: mtmd_context_p) -> c_bool:
     ...
 
-# // get audio bitrate in Hz, for example 16000 for Whisper
+# // get audio sample rate in Hz, for example 16000 for Whisper
 # // return -1 if audio is not supported
-# MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
+# MTMD_API int mtmd_get_audio_sample_rate(mtmd_context * ctx);
 @ctypes_function_mtmd(
-    "mtmd_get_audio_bitrate", [mtmd_context_p_ctypes], c_int)
-def mtmd_get_audio_bitrate(ctx: mtmd_context_p) -> c_int:
+    "mtmd_get_audio_sample_rate", [mtmd_context_p_ctypes], c_int)
+def mtmd_get_audio_sample_rate(ctx: mtmd_context_p) -> c_int:
+    """
+    get audio sample rate in Hz, for example 16000 for Whisper
+    return -1 if audio is not supported
+    """
     ...
 
 # // mtmd_bitmap

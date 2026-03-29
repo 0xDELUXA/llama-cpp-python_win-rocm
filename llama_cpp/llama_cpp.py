@@ -1115,9 +1115,62 @@ class llama_chat_message(ctypes.Structure):
 
 
 # // lora adapter
-# struct llama_adapter_lora;
+# struct llama_adapter_lora {
+#     llama_model * model = nullptr;
+
+#     // map tensor name to lora_a_b
+#     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
+
+#     std::vector<ggml_context_ptr> ctxs;
+#     std::vector<ggml_backend_buffer_ptr> bufs;
+
+#     float alpha;
+
+#     // gguf metadata
+#     std::unordered_map<std::string, std::string> gguf_kv;
+
+#     // activated lora (aLoRA)
+#     std::vector<llama_token> alora_invocation_tokens;
+
+#     explicit llama_adapter_lora(llama_model * model) : model(model) {}
+#     ~llama_adapter_lora() = default;
+
+#     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+
+#     uint32_t get_n_nodes() const {
+#         return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat
+#     }
+# };
 llama_adapter_lora_p = ctypes.c_void_p
 llama_adapter_lora_p_ctypes = ctypes.POINTER(ctypes.c_void_p)
+
+# // llama_adapter_cvec
+# struct llama_adapter_cvec {
+#     ggml_tensor * tensor_for(int il) const;
+
+#     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
+
+#     bool apply(
+#             const llama_model & model,
+#             const float * data,
+#             size_t len,
+#             int32_t n_embd,
+#             int32_t il_start,
+#             int32_t il_end);
+
+# private:
+#     bool init(const llama_model & model);
+
+#     int32_t layer_start = -1;
+#     int32_t layer_end   = -1;
+
+#     std::vector<ggml_context_ptr> ctxs;
+#     std::vector<ggml_backend_buffer_ptr> bufs;
+
+#     std::vector<ggml_tensor *> tensors; // per layer
+# };
+llama_adapter_cvec_p = ctypes.c_void_p
+llama_adapter_cvec_p_ctypes = ctypes.POINTER(ctypes.c_void_p)
 
 
 # // Helpers for getting default parameters
@@ -1308,6 +1361,24 @@ def llama_model_load_from_file(
     Load a model from a file
     If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
     If the split file name does not follow this pattern, use llama_model_load_from_splits
+    """
+    ...
+
+
+# // Load a model from an open FILE pointer
+# LLAMA_API struct llama_model * llama_model_load_from_file_ptr(
+#                                 FILE * file,
+#             struct llama_model_params   params);
+@ctypes_function(
+    "llama_model_load_from_file_ptr",
+    [ctypes.c_void_p, llama_model_params],
+    llama_model_p_ctypes,
+)
+def llama_model_load_from_file_ptr(
+    file: ctypes.c_void_p, params: llama_model_params, /
+) -> Optional[llama_model_p]:
+    """
+    Load a model from an open FILE pointer
     """
     ...
 
@@ -1911,9 +1982,12 @@ def llama_model_quantize(
     ...
 
 
+# //
+# // Adapters
+# //
+
 # // Load a LoRA adapter from file
 # // The adapter is valid as long as the associated model is not freed
-# // All adapters must be loaded before context creation
 # LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init(
 #         struct llama_model * model,
 #         const char * path_lora);
@@ -2016,9 +2090,8 @@ def llama_adapter_meta_val_str_by_index(
 
 
 # // Manually free a LoRA adapter
-# // Note: loaded adapters will be free when the associated model is deleted
-# LLAMA_API DEPRECATED(void llama_adapter_lora_free(struct llama_adapter_lora * adapter),
-#         "adapters are now freed together with the associated model");
+# // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
+# LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
 @ctypes_function(
     "llama_adapter_lora_free",
     [llama_adapter_lora_p_ctypes],
@@ -2043,7 +2116,7 @@ def llama_adapter_get_alora_n_invocation_tokens(adapter: llama_adapter_lora_p, /
 @ctypes_function(
     "llama_adapter_get_alora_invocation_tokens",
     [llama_adapter_lora_p_ctypes],
-    ctypes.c_uint64,
+    ctypes.POINTER(llama_token),
 )
 def llama_adapter_get_alora_invocation_tokens(adapter: llama_adapter_lora_p, /) -> CtypesPointer[llama_token]:
     ...
@@ -2060,14 +2133,23 @@ def llama_adapter_get_alora_invocation_tokens(adapter: llama_adapter_lora_p, /) 
 #         float * scales);
 @ctypes_function(
     "llama_set_adapters_lora",
-    [llama_context_p_ctypes, ctypes.POINTER(llama_adapter_lora_p_ctypes), ctypes.c_size_t, ctypes.c_float],
+    [llama_context_p_ctypes,
+     ctypes.POINTER(llama_adapter_lora_p_ctypes),
+     ctypes.c_size_t,
+     ctypes.POINTER(ctypes.c_float)
+    ],
     ctypes.c_int32,
 )
 def llama_set_adapters_lora(
-    ctx: llama_context_p, adapters: CtypesArray[llama_adapter_lora_p], n_adapters: ctypes.c_size_t, scale: float, /
+    ctx: llama_context_p,
+    adapters: Optional[CtypesArray[llama_adapter_lora_p]],
+    n_adapters: ctypes.c_size_t,
+    scales: Optional[CtypesArray[ctypes.c_float]], /
 ) -> int:
-    """Set LoRa adapters on the context.
-    Will only modify if the adapters currently in context are different."""
+    """
+    Set LoRa adapters on the context.
+    Will only modify if the adapters currently in context are different.
+    """
     ...
 
 

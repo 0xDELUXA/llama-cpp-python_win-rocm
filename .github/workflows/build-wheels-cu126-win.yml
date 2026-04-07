@@ -1,4 +1,4 @@
-name: Build Wheels (CU128) for Windows
+name: Build Wheels (CU126) for Windows
 
 on:
   workflow_dispatch:
@@ -14,9 +14,9 @@ jobs:
       matrix:
         os: ['windows-2022']
         pyver: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-        cuda: ["12.8.1"]
+        cuda: ["12.6.3"]
         releasetag: ["Basic"]
-        cudaarch: ["75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120-real"]
+        cudaarch: ["70-real;75-real;80-real;86-real;87-real;89-real;90-real"]
     defaults:
       run:
         shell: pwsh
@@ -72,13 +72,13 @@ jobs:
           $env:CMAKE_ARGS = "-DENABLE_CCACHE=on -DLLAMA_CURL=off $env:CMAKE_ARGS"
 
           if ($env:AVXVER -eq 'AVX') {
-            $env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX=on -DGGML_AVX2=off -DGGML_FMA=off -DGGML_F16C=off'
+            $env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off'
           }
           if ($env:AVXVER -eq 'AVX2') {
             $env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX512=off'
           }
           if ($env:AVXVER -eq 'AVXVNNI') {
-            $env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX_VNNI=on'
+            $env:CMAKE_ARGS = $env:CMAKE_ARGS + '  -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX_VNNI=on'
           }
           # if ($env:AVXVER -eq 'AVX512') {
           #  $env:CMAKE_ARGS = $env:CMAKE_ARGS + ' -DGGML_AVX512=on'
@@ -97,7 +97,7 @@ jobs:
 
           $wheelFile = Get-Item '.\dist\*.whl' | Select-Object -First 1
 
-          # Split file name: name-ver-py-abi-plat.whl
+          # Split wheel filename: name-ver-py-abi-plat.whl
           $parts = $wheelFile.Name.Split('-')
           $distName = $parts[0]
           $version  = $parts[1]

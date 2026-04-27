@@ -351,6 +351,7 @@ LLAMA_TOKEN_ATTR_SINGLE_WORD = 1 << 9
 #     LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+#     LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
 #
 #     LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
 # };
@@ -391,6 +392,7 @@ LLAMA_FTYPE_MOSTLY_TQ1_0 = 36
 LLAMA_FTYPE_MOSTLY_TQ2_0 = 37
 LLAMA_FTYPE_MOSTLY_MXFP4_MOE = 38
 LLAMA_FTYPE_MOSTLY_NVFP4 = 39
+LLAMA_FTYPE_MOSTLY_Q1_0 = 40
 LLAMA_FTYPE_GUESSED = 1024
 
 # enum llama_rope_scaling_type {
@@ -458,14 +460,16 @@ def llama_flash_attn_type_name(
     """
 
 # enum llama_split_mode {
-#     LLAMA_SPLIT_MODE_NONE  = 0, // single GPU
-#     LLAMA_SPLIT_MODE_LAYER = 1, // split layers and KV across GPUs
-#     LLAMA_SPLIT_MODE_ROW   = 2, // split rows across GPUs
+#     LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
+#     LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
+#     LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
+#     LLAMA_SPLIT_MODE_TENSOR = 3,
 # };
-LLAMA_SPLIT_MODE_NONE = 0
-LLAMA_SPLIT_MODE_LAYER = 1
-LLAMA_SPLIT_MODE_ROW = 2
-
+class llama_split_mode(enum.IntEnum):
+    LLAMA_SPLIT_MODE_NONE   = 0
+    LLAMA_SPLIT_MODE_LAYER  = 1
+    LLAMA_SPLIT_MODE_ROW    = 2
+    LLAMA_SPLIT_MODE_TENSOR = 3
 
 # typedef struct llama_token_data {
 #     llama_token id; // token id
@@ -1010,7 +1014,7 @@ class llama_model_imatrix_data(ctypes.Structure):
 
     if TYPE_CHECKING:
         name: ctypes.c_char_p
-        data: ctypes.POINTER(ctypes.c_float)
+        data: ctypes.POINTER(ctypes.c_float) # type: ignore
         size: ctypes.c_size_t
 
 llama_model_imatrix_data_p = ctypes.POINTER(llama_model_imatrix_data)
@@ -1064,10 +1068,10 @@ class llama_model_quantize_params(ctypes.Structure):
         pure: bool
         keep_split: bool
         dry_run: bool
-        imatrix: ctypes.POINTER(llama_model_imatrix_data)
-        kv_overrides: ctypes.POINTER(llama_model_kv_override)
-        tensor_types: ctypes.POINTER(llama_model_tensor_override)
-        prune_layers: ctypes.POINTER(ctypes.c_int32)
+        imatrix: ctypes.POINTER(llama_model_imatrix_data) # type: ignore
+        kv_overrides: ctypes.POINTER(llama_model_kv_override) # type: ignore
+        tensor_types: ctypes.POINTER(llama_model_tensor_override) # type: ignore
+        prune_layers: ctypes.POINTER(ctypes.c_int32) # type: ignore
 
     _fields_ = [
         ("nthread", ctypes.c_int32),
@@ -1341,7 +1345,7 @@ llama_model_set_tensor_data_t = ctypes.CFUNCTYPE(
 )
 def llama_model_init_from_user(
     metadata: ctypes.c_void_p,
-    set_tensor_data: llama_model_set_tensor_data_t,
+    set_tensor_data: llama_model_set_tensor_data_t, # type: ignore
     set_tensor_data_ud: ctypes.c_void_p,
     params: llama_model_params,
     /
@@ -1513,53 +1517,6 @@ class llama_params_fit_status(enum.IntEnum):
     LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0
     LLAMA_PARAMS_FIT_STATUS_FAILURE = 1
     LLAMA_PARAMS_FIT_STATUS_ERROR   = 2
-
-
-# // fits mparams and cparams to free device memory (assumes system memory is unlimited)
-# //   - returns true if the parameters could be successfully modified to fit device memory
-# //   - this function is NOT thread safe because it modifies the global llama logger state
-# //   - only parameters that have the same value as in llama_default_model_params are modified
-# //     with the exception of the context size which is modified if and only if equal to 0
-# LLAMA_API enum llama_params_fit_status llama_params_fit(
-#                                 const char   * path_model,
-#                 struct llama_model_params   * mparams,
-#                 struct llama_context_params * cparams,
-#                                         float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
-#     struct llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
-#                                         size_t   margin,                // margin of memory to leave per device in bytes
-#                                     uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-#                         enum ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
-@ctypes_function(
-    "llama_params_fit",
-    [
-        ctypes.c_char_p,
-        llama_model_params_p,
-        llama_context_params_p,
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(llama_model_tensor_buft_override),
-        ctypes.c_size_t,
-        ctypes.c_uint32,
-        ctypes.c_int,
-    ],
-    ctypes.c_int,
-)
-def llama_params_fit(
-    path_model: ctypes.c_char_p,
-    mparams: CtypesPointer[llama_model_params],
-    cparams: CtypesPointer[llama_context_params],
-    tensor_split: CtypesPointer[ctypes.c_float],
-    tensor_buft_overrides: CtypesPointer[llama_model_tensor_buft_override],
-    margin: ctypes.c_size_t,
-    n_ctx_min: ctypes.c_uint32,
-    log_level: int,
-    /,
-) -> int:
-    """
-    fits mparams and cparams to free device memory (assumes system memory is unlimited)
-    returns true if the parameters could be successfully modified to fit device memory
-    this function is NOT thread safe because it modifies the global llama logger state
-    """
-    ...
 
 
 # LLAMA_API int64_t llama_time_us(void);
@@ -4544,7 +4501,7 @@ def llama_sampler_init_grammar_lazy_patterns(
     vocab: llama_vocab_p,
     grammar_str: bytes,
     grammar_root: bytes,
-    trigger_patterns: CtypesArray[bytes],
+    trigger_patterns: CtypesArray[bytes], # type: ignore
     num_trigger_patterns: int,
     trigger_tokens: CtypesArray[llama_token],
     num_trigger_tokens: int,
@@ -4799,8 +4756,8 @@ def llama_print_system_info() -> bytes:
     None,
 )
 def llama_log_get(
-    log_callback: Optional[ctypes.pointer(ggml_log_callback)],
-    user_data: ctypes.pointer(ctypes.c_void_p),
+    log_callback: Optional[ctypes.pointer(ggml_log_callback)], # type: ignore
+    user_data: ctypes.pointer(ctypes.c_void_p), # type: ignore
     /,
 ):
     """Get callback for all future logging events.
@@ -4815,7 +4772,7 @@ def llama_log_get(
     None,
 )
 def llama_log_set(
-    log_callback: Optional[ggml_log_callback],
+    log_callback: Optional[ggml_log_callback], # type: ignore
     user_data: ctypes.c_void_p,
     /,
 ):
@@ -4923,17 +4880,6 @@ def llama_perf_sampler_print(chain: llama_sampler_p, /):
     None,
 )
 def llama_perf_sampler_reset(chain: llama_sampler_p, /):
-    ...
-
-
-# // print a breakdown of per-device memory use via LLAMA_LOG:
-# LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);
-@ctypes_function(
-    "llama_memory_breakdown_print",
-    [llama_context_p_ctypes],
-    None,
-)
-def llama_memory_breakdown_print(ctx: llama_context_p, /):
     ...
 
 

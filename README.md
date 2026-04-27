@@ -4,28 +4,38 @@
 
 #  Python Bindings for [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
 
-[![Documentation Status](https://readthedocs.org/projects/llama-cpp-python/badge/?version=latest)](https://llama-cpp-python.readthedocs.io/en/latest/?badge=latest)
 [![Tests](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml/badge.svg?branch=main)](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml)
 ![GitHub Tag](https://img.shields.io/github/v/tag/JamePeng/llama-cpp-python)
 [![PyPI - License](https://img.shields.io/pypi/l/llama-cpp-python)](https://pypi.org/project/llama-cpp-python/)
 [![PyPI - Downloads](https://static.pepy.tech/badge/llama-cpp-python/month)](https://pepy.tech/projects/llama-cpp-python)
 [![Github All Releases](https://img.shields.io/github/downloads/abetlen/llama-cpp-python/total.svg?label=Github%20Downloads)]()
 
-Simple Python bindings for **@ggerganov's** [`llama.cpp`](https://github.com/ggml-org/llama.cpp) library.
+Efficiency Python bindings for **ggml-org's** [`llama.cpp`](https://github.com/ggml-org/llama.cpp) library.
 This package provides:
 
 - Low-level access to C API via `ctypes` interface.
+    - [llama_cpp_lib](https://github.com/JamePeng/llama-cpp-python/blob/main/llama_cpp/llama_cpp.py)
+    - [mtmd_cpp_lib](https://github.com/JamePeng/llama-cpp-python/blob/main/llama_cpp/mtmd_cpp.py)
 - High-level Python API for text completion
-    - OpenAI-like API
-    - [LangChain compatibility](https://python.langchain.com/docs/integrations/llms/llamacpp)
-    - [LlamaIndex compatibility](https://docs.llamaindex.ai/en/stable/examples/llm/llama_2_llama_cpp.html)
-- OpenAI compatible web server
-    - [Local Copilot replacement](https://llama-cpp-python.readthedocs.io/en/latest/server/#code-completion)
-    - [Function Calling support](https://llama-cpp-python.readthedocs.io/en/latest/server/#function-calling)
-    - [Vision API support](https://llama-cpp-python.readthedocs.io/en/latest/server/#multimodal-models)
-    - [Multiple Models](https://llama-cpp-python.readthedocs.io/en/latest/server/#configuration-and-multi-model-support)
+    - OpenAI-like API and Type([llama_types.py](https://github.com/JamePeng/llama-cpp-python/blob/main/llama_cpp/llama_types.py))
+    - [High-level API](https://github.com/JamePeng/llama-cpp-python#high-level-api)
+    - [Continuing Assistant Responses (Prefill)](https://github.com/JamePeng/llama-cpp-python#continuing-assistant-responses-prefill)
+    - [Dynamic LoRA Routing & Control Vectors (Multi-Tenant Serving)](https://github.com/JamePeng/llama-cpp-python#dynamic-lora-routing--control-vectors-multi-tenant-serving)
+        - [Dynamic LoRA Example](https://github.com/JamePeng/llama-cpp-python#dynamic-lora-example)
+        - [Control Vector Injection (Representation Engineering)](https://github.com/JamePeng/llama-cpp-python#control-vector-injection-representation-engineering)
+    - [Sampling Configuration & Usage (LlamaSamplingParams)](https://github.com/JamePeng/llama-cpp-python#sampling-configuration--usage-llamasamplingparams)
+    - [Multi-modal Models Support](https://github.com/JamePeng/llama-cpp-python#multi-modal-models)
+        - Support Models Lists
+        - [Loading a Local Image With Qwen3VL(Thinking/Instruct)](https://github.com/JamePeng/llama-cpp-python#loading-a-local-image-with-qwen3vlthinkinginstruct)
+        - [Comprehensive Omni MultiModal Example: Gemma-4 (Vision + Audio + Text)](https://github.com/JamePeng/llama-cpp-python#comprehensive-omni-multimodal-example-gemma-4-vision--audio--text)
+    - [Embeddings & Reranking (GGUF)](https://github.com/JamePeng/llama-cpp-python#embeddings--reranking-gguf)
+        - [1. Text Embeddings (Vector Search)](https://github.com/JamePeng/llama-cpp-python#1-text-embeddings-vector-search)
+        - [2. Reranking (Cross-Encoder Scoring)](https://github.com/JamePeng/llama-cpp-python#2-reranking-cross-encoder-scoring)
+        - [3. Normalization](https://github.com/JamePeng/llama-cpp-python#3-normalization)
+    - [Speculative Decoding](https://github.com/JamePeng/llama-cpp-python#speculative-decoding)
+- [FAQ](https://github.com/JamePeng/llama-cpp-python#faq)
 
-Documentation is available at [https://llama-cpp-python.readthedocs.io/en/latest](https://llama-cpp-python.readthedocs.io/en/latest).
+The new documentation will be maintained in the [docs/wiki](https://github.com/JamePeng/llama-cpp-python/tree/main/docs/wiki) directory based on the LLM Wiki approach. Interested volunteers are welcome to participate in its maintenance and updates :)
 
 
 ## Discussions
@@ -225,6 +235,8 @@ Installing a CUDA-supported version requires the `CUDA Toolkit` environment to b
 
 See here: https://developer.nvidia.com/cuda-toolkit-archive
 
+More Information see: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#cuda
+
 Then, set the `GGML_CUDA=on` environment variable before installing:
 
 ```bash
@@ -263,12 +275,63 @@ CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" pip install "llama-cpp-p
 </details>
 
 <details>
-<summary>Metal</summary>
+<summary>OpenVINO</summary>
 
-To install with Metal (MPS), set the `GGML_METAL=on` environment variable before installing:
+### Install OpenVINO Runtime
+
+Follow the guide to install OpenVINO Runtime from an archive file: [Linux](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-linux.html) | [Windows](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-windows.html)
+
+- **Linux:**
+
+    <details>
+    <summary>📦 Click to expand OpenVINO installation from an archive file on Ubuntu</summary>
+    <br>
+
+    ```bash
+    wget https://raw.githubusercontent.com/ravi9/misc-scripts/main/openvino/ov-archive-install/install-openvino-from-archive.sh
+    chmod +x install-openvino-from-archive.sh
+    ./install-openvino-from-archive.sh
+    ```
+
+    Verify OpenVINO is initialized properly:
+    ```bash
+    echo $OpenVINO_DIR
+    ```
+    </details>
+
+### Supported Devices
+
+OpenVINO backend supports the following hardware:
+
+- Intel CPUs
+- Intel GPUs (integrated and discrete)
+- Intel NPUs
+
+Although OpenVINO supports a wide range of [Intel hardware](https://docs.openvino.ai/2026/about-openvino/release-notes-openvino/system-requirements.html), the llama.cpp OpenVINO backend has been validated specifically on AI PCs such as the Intel® Core™ Ultra Series 1 and Series 2.
+
+More Information see: https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENVINO.md
+
+To install with OpenVINO, set the `GGML_OPENVINO=ON` environment variable before installing:
 
 ```bash
-CMAKE_ARGS="-DGGML_METAL=on -DGGML_METAL_USE_BF16=on" pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git"
+# Linux
+source /opt/intel/openvino/setupvars.sh
+# Windows
+"C:\Program Files (x86)\Intel\openvino_2026.0\setupvars.bat"
+# Build
+CMAKE_ARGS="-DGGML_OPENVINO=ON" pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git"
+```
+</details>
+
+<details>
+<summary>Metal</summary>
+
+On MacOS, Metal is enabled by default(`GGML_METAL=ON`). Using Metal makes the computation run on the GPU.
+
+To disable the Metal build at compile time use the `CMAKE_ARGS="-DGGML_METAL=OFF"` cmake option.
+
+```bash
+pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git"
 ```
 
 **Pre-built Wheel (New)**
@@ -306,7 +369,20 @@ More details see here: https://github.com/ggml-org/llama.cpp/blob/master/docs/bu
 
 - For Windows User: Download and install the [`Vulkan SDK`](https://vulkan.lunarg.com/sdk/home#windows) with the default settings.
 
-- For Linux User: Follow the official LunarG instructions for the installation and setup of the Vulkan SDK in the [Getting Started with the Linux Tarball Vulkan SDK](https://vulkan.lunarg.com/doc/sdk/latest/linux/getting_started.html) guide.
+- For Linux User:
+    * First, follow the official LunarG instructions for the installation and setup of the Vulkan SDK in the [Getting Started with the Linux Tarball Vulkan SDK](https://vulkan.lunarg.com/doc/sdk/latest/linux/getting_started.html) guide.
+
+    * After completing the first step, ensure that you have used the `source` command on the `setup_env.sh` file inside of the Vulkan SDK in your current terminal session. Otherwise, the build won't work. Additionally, if you close out of your terminal, you must perform this step again if you intend to perform a build. However, there are ways to make this persistent. Refer to the Vulkan SDK guide linked in the first step for more information about any of this.
+
+- For Mac User:
+    * Generally, follow LunarG's [Getting Started with the MacOS Vulkan SDK](https://vulkan.lunarg.com/doc/sdk/latest/mac/getting_started.html) guide for installation and setup of the Vulkan SDK. There are two options of Vulkan drivers on macOS, both of which implement translation layers to map Vulkan to Metal. They can be hot-swapped by setting the `VK_ICD_FILENAMES` environment variable to point to the respective ICD JSON file. Check the box for "KosmicKrisp" during the LunarG Vulkan SDK installation.
+
+    * Set environment variable for the LunarG Vulkan SDK after installation (and optionally add to your shell profile for persistence):
+        ```bash
+        source /path/to/vulkan-sdk/setup-env.sh
+        ```
+
+More Information see: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#vulkan
 
 Then install with Vulkan support by set the `GGML_VULKAN=on` environment variable before installing:
 
@@ -319,11 +395,35 @@ CMAKE_ARGS="-DGGML_VULKAN=on" pip install "llama-cpp-python @ git+https://github
 <details>
 <summary>SYCL</summary>
 
+### Supported OS
+
+| OS      | Status  | Verified                                       |
+|---------|---------|------------------------------------------------|
+| Linux   | Support | Ubuntu 22.04, Fedora Silverblue 39, Arch Linux |
+| Windows | Support | Windows 11                                     |
+
+### Intel GPU
+
+SYCL backend supports Intel GPU Family:
+
+- Intel Data Center Max Series
+- Intel Flex Series, Arc Series
+- Intel Built-in Arc GPU
+- Intel iGPU in Core CPU (11th Generation Core CPU and newer, refer to [oneAPI supported GPU](https://www.intel.com/content/www/us/en/developer/articles/system-requirements/intel-oneapi-base-toolkit-system-requirements.html#inpage-nav-1-1)).
+
+On older Intel GPUs, you may try [OpenCL](/docs/backend/OPENCL.md) although the performance is not optimal, and some GPUs may not support OpenCL nor have any GPGPU capabilities.
+
+More Information see here: https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md
+
 To install with SYCL support, set the `GGML_SYCL=on` environment variable before installing:
 
 ```bash
-source /opt/intel/oneapi/setvars.sh   
+# Export relevant ENV variables
+source /opt/intel/oneapi/setvars.sh
+# Option 1: Use FP32 (recommended for better performance in most cases)
 CMAKE_ARGS="-DGGML_SYCL=on -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx" pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git"
+# Option 2: Use FP16
+CMAKE_ARGS="-DGGML_SYCL=on -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON" pip install "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git"
 ```
 </details>
 
@@ -837,6 +937,8 @@ Below are the supported multi-modal models and their respective chat handlers (P
 | [qwen2.5-vl](https://huggingface.co/unsloth/Qwen2.5-VL-3B-Instruct-GGUF) | `Qwen25VLChatHandler` | `qwen2.5-vl` |
 | [qwen3-vl](https://huggingface.co/unsloth/Qwen3-VL-8B-Thinking-GGUF) | `Qwen3VLChatHandler` | `qwen3-vl` |
 | [qwen3.5](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | `Qwen35ChatHandler` | `qwen3.5` |
+| [qwen3.6](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | `Qwen35ChatHandler` | `qwen3.6` |
+| [step3-vl](https://huggingface.co/JamePeng2023/Step3-VL-10B-GGUF) | `Step3VLChatHandler` | `step3-vl` |
 
 Then you'll need to use a custom chat handler to load the clip model and process the chat messages and images.
 
@@ -902,9 +1004,13 @@ print(response["choices"][0]["text"])
 
 **Note**: Multi-modal models also support tool calling and JSON mode.
 
+
 ## Loading a Local Image With Qwen3VL(Thinking/Instruct)
 
-This script demonstrates how to load a local image, encode it as a base64 Data URI, and pass it to a local Qwen3-VL model (with the 'force_reasoning' parameter enabled for thinking model, disabled for instruct model) for processing using the llama-cpp-python library.
+<summary>This script demonstrates how to load a local image, encode it as a base64 Data URI, and pass it to a local Qwen3-VL model (with the 'force_reasoning' parameter enabled for thinking model, disabled for instruct model) for processing using the llama-cpp-python library.</summary><br>
+
+
+**Example Code**: <details>
 
 ```python
 # Import necessary libraries
@@ -1053,6 +1159,165 @@ res = llm.create_chat_completion(
 print(res["choices"][0]["message"]["content"])
 
 ```
+
+</details>
+
+## Comprehensive Omni MultiModal Example: Gemma-4 (Vision + Audio + Text)
+
+Below is a complete, production-ready example demonstrating how to dynamically route and process both image and audio files. It includes a universal media processor that automatically converts local files into the correct payload structure (Data URIs for images, and `input_audio` for audio files).
+
+> **⚠️ IMPORTANT: GEMMA-4 MODEL CAPABILITIES & LIMITATIONS**
+> * **Gemma4 E2B / E4B:** Supports Full Multimodal (Vision + Audio + Text). `enable_thinking` **MUST** be `True`(default).
+> * **Gemma4 31B / 26BA4B:** Supports Vision + Text ONLY (Audio is NOT supported). `enable_thinking` can be toggled (`True` or `False`).
+
+```python
+from llama_cpp import Llama
+from llama_cpp.llama_chat_format import Gemma4ChatHandler
+import base64
+import os
+
+# Model and multimodal projection paths
+MODEL_PATH = r"/path/to/Gemma-4-E4B-It-BF16.gguf"
+# BF16 mmproj is required for audio. Other quantizations are known to have degraded performance.
+MMPROJ_PATH = r"/path/to/mmproj-Gemma-4-E4B-It-BF16.gguf"
+
+# Initialize the Llama model with multimodal support
+# Note: Since we are using E4B here, enable_thinking MUST be True, and audio is supported.
+llm = Llama(
+    model_path=MODEL_PATH,
+    chat_handler=Gemma4ChatHandler(
+        clip_model_path=MMPROJ_PATH,
+        enable_thinking=True,  # MUST be True for E2B/E4B models
+        verbose=True,          # Enable Debug Info
+    ),
+    n_gpu_layers=-1,
+    n_ctx=10240,
+    verbose=True,              # Enable Debug Info
+)
+
+# 1. Extend the MIME dictionary to support audio formats
+_MEDIA_MIME_TYPES = {
+    # ------ Image formats ------
+    '.png':  ('image', 'image/png'),
+    '.jpg':  ('image', 'image/jpeg'),
+    '.jpeg': ('image', 'image/jpeg'),
+    '.gif':  ('image', 'image/gif'),
+    '.webp': ('image', 'image/webp'),
+    '.bmp':  ('image', 'image/bmp'),
+
+    # ------ Audio formats ------
+    '.wav':  ('audio', 'wav'),    # OpenAI standard usually uses raw format names for audio
+    '.mp3':  ('audio', 'mp3'),
+    # '.flac': ('audio', 'flac'),
+}
+
+def build_media_payload(file_path: str) -> dict:
+    """
+    Read a local media file (image or audio) and convert it into a valid input payload for the LLM.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Media file not found: {file_path}")
+
+    extension = os.path.splitext(file_path)[1].lower()
+    media_category, mime_or_format = _MEDIA_MIME_TYPES.get(extension, ('unknown', 'application/octet-stream'))
+
+    if media_category == 'unknown':
+        print(f"Warning: Unknown extension '{extension}'. It might not be processed correctly.")
+
+    # Read and Base64 encode the file
+    with open(file_path, "rb") as f:
+        encoded_data = base64.b64encode(f.read()).decode("utf-8")
+
+    # 2. Return the appropriate dictionary structure based on the media type
+    if media_category == 'image':
+        # Image format: Data URI (OpenAI compatible)
+        data_uri = f"data:{mime_or_format};base64,{encoded_data}"
+        return {
+            "type": "image_url",
+            "image_url": {"url": data_uri}
+        }
+
+    elif media_category == 'audio':
+        # Audio format: input_audio (OpenAI compatible)
+        return {
+            "type": "input_audio",
+            "input_audio": {
+                "data": encoded_data,
+                "format": mime_or_format
+            }
+        }
+    else:
+        # Fallback for unsupported formats
+        return {"type": "text", "text": f"[Attached unsupported file: {file_path}]"}
+
+
+def run_inference(media_paths: list, text_prompt: str):
+    """
+    Helper function to dynamically build the payload and run inference.
+    """
+    # 3. Build the user_content list
+    user_content = []
+
+    # Automatically parse each file and append to the payload
+    for path in media_paths:
+        payload = build_media_payload(path)
+        user_content.append(payload)
+
+    # Append the final text instruction
+    user_content.append({
+        "type": "text",
+        "text": text_prompt
+    })
+
+    print(f"\n--- Running Inference with {len(media_paths)} media file(s) ---")
+
+    # 4. Send to the model for inference
+    response = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": """
+            You are a highly capable multimodal assistant that can process both text, vision and audio.
+
+            """}, # Note: Supported ONLY by Gemma4 E2B / E4B.
+            {"role": "user", "content": user_content}
+        ],
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        max_tokens=8192,
+    )
+
+    print("\n[Model Response]:")
+    print(response["choices"][0]["message"]["content"])
+    print("-" * 60)
+
+
+# ==============================================================================
+# Main Inference Examples
+# Uncomment the example block you wish to execute.
+# ==============================================================================
+
+# --- Example A: Image + Audio (Full Multimodal) ---
+# Note: Supported ONLY by Gemma4 E2B / E4B.
+run_inference(
+    media_paths=[r"/path/to/test.png", r"/path/to/test.wav"],
+    text_prompt="Introduce the content by combining the images and converting the audio to text."
+)
+
+# --- Example B: Image Only (Vision + Text) ---
+# Note: Supported by all Gemma4 variants (E2B, E4B, 31B, 26BA4B).
+# run_inference(
+#     media_paths=[r"/path/to/test.png"],
+#     text_prompt="Describe the contents of this image in detail."
+# )
+
+# --- Example C: Audio Only (Audio + Text) ---
+# Note: Supported ONLY by Gemma4 E2B / E4B.
+# run_inference(
+#     media_paths=[r"/path/to/test.wav"],
+#     text_prompt="Transcribe this audio and summarize the main points."
+# )
+```
+
 
 ---
 
@@ -1208,19 +1473,29 @@ emb = llm.create_embedding("text")
 
 `llama-cpp-python` supports speculative decoding which allows the model to generate completions based on a draft model.
 
-The fastest way to use speculative decoding is through the `LlamaPromptLookupDecoding` class.
+The fastest way to use speculative decoding is through the `LlamaNGramMapDecoding`(**Recommend**) or `LlamaPromptLookupDecoding` class.
 
 Just pass this as a draft model to the `Llama` class during initialization.
 
 ```python
 from llama_cpp import Llama
-from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+from llama_cpp.llama_speculative import LlamaNGramMapDecoding
 
 llama = Llama(
-    model_path="path/to/model.gguf",
-    draft_model=LlamaPromptLookupDecoding(num_pred_tokens=10) # num_pred_tokens is the number of tokens to predict 10 is the default and generally good for gpu, 2 performs better for cpu-only machines.
+    model_path="path/to/qwen-3.6-27b.gguf",
+    n_ctx=4096,
+    n_gpu_layers=-1,
+    draft_model=LlamaNGramMapDecoding(
+        ngram_size=3,
+        num_pred_tokens=10
+    )
+)
+
+response = llama.create_chat_completion(
+    messages=[{"role": "user", "content": "Write a python script..."}]
 )
 ```
+Note: `LlamaPromptLookupDecoding.num_pred_tokens` is the number of tokens to predict 10 is the default and generally good for gpu, 2 performs better for cpu-only machines. Now, `LlamaNGramMapDecoding` with the new Hash Map algorithm, draft generation becomes instantaneous $O(1)$, and the time consumption is almost 0 regardless of whether you set the prediction to 2 or 10 words.
 
 ### Adjusting the Context Window
 
